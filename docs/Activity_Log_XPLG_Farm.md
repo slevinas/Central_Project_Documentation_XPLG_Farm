@@ -11,17 +11,44 @@ This document is a centralized record of all tasks, requests, and changes perfor
 
 Below is a table listing each key component, the server it runs on, its installation or working directory, and the basic commands to start, stop, check status, and view logs.
 
-| Component             | Server        | Directory / Path              | Start Command                 | Status Command                        | Logs Path                           |
-| --------------------- | ------------- | ----------------------------- | ----------------------------- | ------------------------------------- | ----------------------------------- |
-| XPLG VPV              | server-01-web | `/opt/xplg/app`               | [Start XPLG App](#xplg-start) | [Check XPLG Status](#xplg-status)     | `/var/log/xplg/app.log`             |
-| GitHub Actions Runner | server-03-ci  | `/opt/runners/actions-runner` | [Start Runner](#runner-start) | [Check Runner Status](#runner-status) | `/opt/runners/actions-runner/_diag` |
-| XPLG Application      | server-01-web | `/opt/xplg/app`               | [Start XPLG App](#xplg-start) | [Check XPLG Status](#xplg-status)     | `/var/log/xplg/app.log`             |
+| Component             | Server        | Directory / Path              | Start Command                      | Status Command                        | Logs Path                           |
+| --------------------- | ------------- | ----------------------------- | ---------------------------------- | ------------------------------------- | ----------------------------------- |
+| XPLG VPV              | MacOs         | ``                            | [Start VPN](#xplg-start)           | [](#s)                                | ``                                  |
+| XPLG Test-Server      | server-flux1  | ``                            | [Connect to Flux1](#connect-flux1) | [](#s)                                | ``                                  |
+| GitHub Actions Runner | server-03-ci  | `/opt/runners/actions-runner` | [Start Runner](#runner-start)      | [Check Runner Status](#runner-status) | `/opt/runners/actions-runner/_diag` |
+| XPLG Application      | server-01-web | `/opt/xplg/app`               | [Start XPLG App](#xplg-start)      | [Check XPLG Status](#xplg-status)     | `/var/log/xplg/app.log`             |
 
 _(Add more rows for additional components as needed.)_
 
 ## Command Reference
 
 For convenience, each command used above is defined here with anchors. Click the links in the table to jump to details below.
+
+---
+
+### MacOs Commands
+
+- \<a name="start-vpn"></a>**Start VPN:**
+
+  ```bash
+  # 1 start vpn
+
+  sudo openfortivpn vpn.xplg.com:64334 \
+  -u slevinas \
+  -p 'C0nnectTmrw1&' \
+  --trusted-cert b67e25a79728362799a2950efa705a6ee19658180e4bdf813dab053856e0111b \
+  --persistent=10 \
+  --set-dns=1 \
+  --set-routes=1 \
+  -v
+  ## 2 enter Macos Pass
+  ```
+
+- \<a name="connect-flux1"></a>**Connect to Flux1:**
+
+  ```bash
+  ssh xlpg-85
+  ```
 
 ### GitHub Actions Runner Commands
 
