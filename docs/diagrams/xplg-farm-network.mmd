@@ -1,0 +1,9 @@
+```mermaid
+graph LR
+  Client --> LB[Load Balancer]
+  LB --> Web1[server-01-web]  
+  Web1 --> DB[server-02-db]
+  CI[server-03-ci runner] --> Web1
+  CI --> DB
+```
+
