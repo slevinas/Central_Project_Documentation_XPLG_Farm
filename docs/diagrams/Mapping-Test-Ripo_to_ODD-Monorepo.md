@@ -59,19 +59,6 @@ Below is a proposed scaffold for a `flux_test_service` harness within `ODD-X8/sr
 
 
 
-```mermaid
-flowchart LR
-  subgraph Monorepo
-    direction LR
-    common["src/common\nAllureClient (HTTP wrapper)"]
-    flux["src/testing_services/flux_test_service\nuploader.py"]
-    results["pytest allure-results/ directory"]
-  end
-
-  results -->|reads directory + metadata| flux
-  flux -->|instantiates AllureClient| common
-  common -->|POST results + metadata| ODD["ODD-Allure Service API"]
-````
 
 ### Directory Tree
 
@@ -80,20 +67,7 @@ flowchart LR
 
 Below is a proposed scaffold for `flux_test_service` harness within `ODD-X8/src/testing_services/`, now including how the HTTP-wrapper (`AllureClient`) in `common/` and the service-level `uploader.py` interact as part of the call flow diagram.
 
-```mermaid
-flowchart LR
-  subgraph Monorepo Call Flow
-    direction LR
-    results["pytest allure-results/ directory"]
-    flux["uploader.py
-(src/testing_services/flux_test_service)"]
-    common["AllureClient (HTTP wrapper)
-(src/common)"]
-    results -->|reads directory + metadata| flux
-    flux -->|instantiates AllureClient| common
-    common -->|POST results + metadata| ODD["ODD-Allure Service API"]
-  end
-````
+
 
 ### Directory Tree Scaffold
 
@@ -183,7 +157,6 @@ flux_test_service.uploader.py
 
 By keeping the raw HTTP logic in common, you avoid duplicating header-construction, error-handling, and retry logic. Meanwhile each service’s uploader.py can remain focused on its own needs (where to find results, what metadata to attach).
 
-```
 
 Key mappings
 
@@ -209,3 +182,277 @@ With this mapping you keep all Flux-Data-Sync-Tests logic inside the new flux_te
 
 
 ```
+flowchart LR
+  subgraph Orchestrator Server (TestServiceServer)
+    direction TB
+    A[Install Docker & GitHub Runner]
+    B[Pull XPLG Flux-Sync Image]
+    C[Run XPLG Flux-Sync Container<br/>(Instance A)]
+  end
+
+  subgraph DockerTester VM (flux-agent)
+    direction TB
+    D[Install Docker]
+    E[Install Python & pytest<br/>(install-python-env.sh)]
+    F[Clone `flux_test_service` Repo]
+    G[Execute `start-flux-tests.sh` script<br/>• Pulls & runs local XPLG Flux-Sync Container (Instance B)<br/>• Prepares environment ready for account initialization and testing]
+    J[Initialize Flux Accounts via API<br/>• Create Source account<br/>• Create Target account]
+    H[Run pytest suite<br/>(pytest --alluredir=allure-results)]
+    I[Upload results to Allure<br/>(upload-to-allure.sh)]
+  end
+
+  A --> B --> C
+  C --> G
+  D --> E --> F --> G --> J --> H --> I
+  I -->|POST results| ODD[ODD-Allure Service API]
+
+```
+
+#### Step-by-Step
+1. **Orchestrator Server**
+
+- Install Docker and register the self-hosted GitHub Actions runner.
+
+- Pull & run the XPLG Flux-Sync Docker image so the service under test is live at e.g. http://<orchestrator>:30303.
+
+2. **Workflow Trigger**
+
+- A push or PR in the ODD-X8 repo fires your .github/workflows/flux-test.yml on the Orchestrator runner.
+
+3. **On Docker-Tester (flux-agent)**
+
+- 3.1. Install Docker (if not already)
+
+- 3.2. Install Python + pytest via install-python-env.sh
+
+- 3.3. Clone the flux_test_service folder from your monorepo
+
+- 3.4. start-flux-tests.sh
+
+ - (Optionally) pull/run its own container or just prepare test inputs
+
+ - Wait for the Orchestrator’s API to be healthy
+
+- 3.5. **Run** pytest --alluredir=allure-results against the Orchestrator’s Flux-Sync API
+
+- 3.6. **Upload** results via upload-to-allure.sh, which uses your service’s uploader.py + common.AllureClient
+
+4. **Reporting**
+
+- The shared AllureClient (in src/common/allure_client.py) handles the HTTP POST to your ODD-Allure API, tagging the run with metadata (branch, build number, timestamp).
+
+This keeps a clear separation:
+
+Orchestrator hosts the service under test.
+
+flux-agent (DockerTester) runs the test harness.
+
+common/AllureClient is reused by any future testing service.
+
+---
+
+#### helpers
+
+
+```bash
+
+ 1850  ls -l *log4j*
+ 1851  cat log4jXpolog.properties 
+ 1852  ip a
+ 1853  cat /etc/resolv.conf
+ 1854  cat /etc/netplan/00-installer-config.yaml 
+ 1855  vi /etc/netplan/00-installer-config.yaml 
+ 1856  sudo vi /etc/netplan/00-installer-config.yaml 
+ 1857  netplan apply
+ 1858  sudo netplan apply
+ 1859  ip a
+ 1860  sudo apt-get remove docker docker-engine docker.io containerd runc
+ 1861  sudo apt-get update
+ 1862  sudo apt-get install -y     ca-certificates     curl     gnupg     lsb-release
+ 1863  sudo mkdir -p /etc/apt/keyrings
+ 1864  curl -fsSL https://download.docker.com/linux/ubuntu/gpg |   sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+ 1865  echo   "deb [arch=$(dpkg --print-architecture) \
+ 1866    signed-by=/etc/apt/keyrings/docker.gpg] \
+ 1867    https://download.docker.com/linux/ubuntu \
+ 1868    $(lsb_release -cs) stable" |   sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+ 1869  sudo apt-get update
+ 1870  sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+ 1871  sudo usermod -aG docker $USER
+ 1872  docker ps
+ 1873  sudo docker ps
+
+```
+
+* plan to implement Step A (Install Docker & GitHub Runner) on your Orchestrator (TestService) server—and how to verify it works:
+
+
+#### 1. Install Docker
+Create a script scripts/setup-docker.sh in your flux_test_service (or under infrastructure/) with:
+
+```bash
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# 1. Install prerequisites
+sudo apt update
+sudo apt install -y ca-certificates curl gnupg lsb-release
+
+# 2. Add Docker’s GPG key
+sudo mkdir -p /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+  | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+
+# 3. Add the Docker APT repo
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+  https://download.docker.com/linux/ubuntu \
+  $(lsb_release -cs) stable" \
+  | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+# 4. Install Docker Engine & tools
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+# 5. (Optional) Allow non-root Docker usage
+sudo usermod -aG docker "$USER"
+
+echo "Docker installed. You may need to log out and back in for group changes to apply."
+```
+Make it executable:
+
+```bash
+
+chmod +x scripts/setup-docker.sh
+```
+**How to test**
+1. Run the script
+
+```bash
+
+./scripts/setup-docker.sh
+```
+2. **Verify Docker version**
+
+```bash
+
+docker --version
+# should print something like: Docker version 24.0.2, build…
+```
+3. **Run the hello-world container**
+
+```bash
+
+docker run --rm hello-world
+```
+You should see “Hello from Docker!” in the logs.
+
+#### 2. Install & Configure the Self-Hosted GitHub Actions Runner
+Create a script scripts/configure-runner.sh:
+
+bash
+Copy
+Edit
+#!/usr/bin/env bash
+set -euo pipefail
+
+# 1. Variables – adjust these
+ORG_OR_REPO_URL="https://github.com/your-org/ODD-X8"
+RUNNER_NAME="orchestrator"
+RUNNER_LABELS="self-hosted,orchestrator"
+
+# 2. Create runner directory
+mkdir -p actions-runner && cd actions-runner
+
+# 3. Download the latest runner package
+#    Check https://github.com/actions/runner/releases for newest version
+RUNNER_VERSION="2.326.0"
+curl -O -L \
+  "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
+tar xzf "actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
+
+# 4. Fetch a registration token from GitHub UI:
+#    GitHub → ODD-X8 → Settings → Actions → Runners → New self-hosted runner → copy token
+read -p "Enter GitHub registration token: " REG_TOKEN
+
+# 5. Configure the runner (unattended)
+./config.sh --unattended \
+  --url "${ORG_OR_REPO_URL}" \
+  --token "${REG_TOKEN}" \
+  --name "${RUNNER_NAME}" \
+  --labels "${RUNNER_LABELS}"
+
+# 6. Install as a systemd service & start
+sudo ./svc.sh install
+sudo ./svc.sh start
+
+echo "Runner configured and started."
+Make it executable:
+
+bash
+Copy
+Edit
+chmod +x scripts/configure-runner.sh
+How to test
+Run the script on your orchestrator VM:
+
+bash
+Copy
+Edit
+./scripts/configure-runner.sh
+Paste in the token when prompted.
+
+Check runner status
+
+bash
+Copy
+Edit
+cd actions-runner
+sudo ./svc.sh status
+You should see it running.
+
+Verify in GitHub
+
+Go to ODD-X8 → Settings → Actions → Runners
+
+You should see your runner named orchestrator online.
+
+Smoke-test a workflow
+Create .github/workflows/runner-test.yml:
+
+yaml
+Copy
+Edit
+name: Runner Smoke Test
+
+on: [workflow_dispatch]
+
+jobs:
+  ping:
+    runs-on: [self-hosted, orchestrator]
+    steps:
+      - run: echo "✅ Runner is alive on $(hostname) at $(date)!"
+In GitHub, click Run workflow on that file. Confirm the job picks up on your orchestrator and prints the message.
+
+3. Pull & Run the XPLG Flux-Sync Image (Steps B & C)
+Once Docker and the runner are in place:
+
+bash
+Copy
+Edit
+# 1. Pull the image
+docker pull xplghub/images:xplg.Main-10032
+
+# 2. Run the container (detached, map port)
+docker run -d \
+  --name flux-sync-orch \
+  -p 30303:30303 \
+  xplghub/images:xplg.Main-10032
+Test that the API is up:
+
+bash
+Copy
+Edit
+curl -I http://localhost:30303/health
+# Expect HTTP/1.1 200
+With those three pieces in place—Docker, the Actions runner, and your service container—you have fully realized Step A (and B/C) on the orchestrator. The next time you push to your monorepo, your runner can begin orchestrating tests on the DockerTester VM.
