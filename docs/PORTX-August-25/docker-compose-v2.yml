@@ -1,0 +1,74 @@
+version: "3.8"
+
+name: xplg-graal-cluster
+
+networks:
+  xplgnet: {}
+
+services:
+  xplg-master:
+    image: xplghub/images:xplg.RC-Graal-10206
+    container_name: xplg-master
+    restart: unless-stopped
+    networks: [xplgnet]
+    # Master exposes to the internal network only
+    expose:
+      - "30303" # HTTP
+      - "30443" # HTTPS
+    environment:
+      # JVM heap
+      ram: "-Xmx2g"
+      # IMPORTANT: full property string, not just a path
+      sharedstorage: "xpolog.home.root.path=/home/data"
+      # Role + inception
+      profile: "-Dxpolog.uid.structure=master"
+      xplg_inception_init_flow: "master"
+      xplg_inceptions_post_init_flow_tasks: "clusterExternalConf"
+    volumes:
+      # Bind mount so you can poke around easily during dev
+      - type: bind
+        source: ${HOST_DATA:-./data}
+        target: /home/data
+
+  xplg-ui:
+    image: xplghub/images:xplg.RC-Graal-10206
+    container_name: xplg-ui
+    restart: unless-stopped
+    networks: [xplgnet]
+    # Publish only the UI outward
+    ports:
+      - "30307:30303" # HTTP
+      - "30447:30443" # HTTPS
+    depends_on:
+      - xplg-master
+    environment:
+      ram: "-Xmx2g"
+      sharedstorage: "xpolog.home.root.path=/home/data"
+      profile: "-Dxpolog.uid.structure=ui"
+      xplg_inception_init_flow: "ui"
+      xplg_inceptions_post_init_flow_tasks: "waitForFile"
+    volumes:
+      - type: bind
+        source: ${HOST_DATA:-./data}
+        target: /home/data
+
+  xplg-processor:
+    image: xplghub/images:xplg.RC-Graal-10206
+    container_name: xplg-processor
+    restart: unless-stopped
+    networks: [xplgnet]
+    expose:
+      - "30303"
+      - "30443"
+    depends_on:
+      - xplg-master
+    environment:
+      ram: "-Xmx2g"
+      sharedstorage: "xpolog.home.root.path=/home/data"
+      profile: "-Dxpolog.uid.structure=processor"
+      xplg_inception_init_flow: "processor"
+      xplg_inceptions_post_init_flow_tasks: "waitForFile"
+    volumes:
+      - type: bind
+        source: ${HOST_DATA:-./data}
+        target: /home/data
