@@ -1,0 +1,44 @@
+name: xplg-single
+services:
+  xplg:
+    image: xplghub/images:xplg.RC-Graal-10206
+    container_name: xplg-single
+    restart: unless-stopped
+    networks: [xplgnet]
+    # UI (HTTP/HTTPS)
+    ports:
+      - "30307:30303" # UI HTTP
+      - "30447:30443" # UI HTTPS
+      # Syslog listener (use high ports to avoid host conflicts with 514)
+      - "5514:5514/udp"
+      - "1468:1468/tcp"
+      # HTTP listener for Fluent Bit
+      - "8088:8088/tcp"
+    environment:
+      # Tune heap to your box; 2g is conservative
+      ram: "-Xmx2g"
+      # Must be full property string, not just a path
+      sharedstorage: "xpolog.home.root.path=/home/data"
+      XPLG_INCEPTION_PARAMS: |
+        xplg_inception_init_flow=ui
+        xpolog.home.root.path=/home/data
+    volumes:
+      # Persist app data/config
+      - type: bind
+        source: /home/xplg/xplg-single/data
+        target: /home/data
+      # Persist Tomcat logs
+      - type: bind
+        source: /home/xplg/xplg-single/logs/tomcat
+        target: /opt/xplg-service/ServletContainer/logs
+      # Persist XPLG app logs
+      - type: bind
+        source: /home/xplg/xplg-single/logs/app
+        target: /opt/xplg-service/log
+      # Optional: a dropbox you can tail/ingest as “Local”
+      - type: bind
+        source: /home/xplg/xplg-single/incoming
+        target: /incoming
+
+networks:
+  xplgnet: {}
