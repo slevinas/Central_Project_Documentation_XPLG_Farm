@@ -6835,3 +6835,253 @@ Keep a single log and create **Saved Searches/Dashboards** filtering by `file` (
 ### What I suggest for you right now
 
 Use **Option 1 (Split)** with one token + three logs + `file`-based gates, then attach per-type parsers inside each log. You can place the three logs under **different folders** to match how you want to browse them, and you’ll still be using a **single HTTP listener** and keeping **all parsing in XPLG**.
+
+
+
+---
+
+You’re asking me to:
+
+1. give a **step-by-step plan** to implement the **one-HTTP-listener** setup where XPLG splits the flow into 3 logs (access, catalina, xplg-app), with **parsing in XPLG only**, and
+2. **define** what we mean by a *log file*, a *record*, and an *event*.
+
+Below is a tight, test-as-you-go plan you can follow verbatim.
+
+---
+
+# Plan: one HTTP listener → 3 logs (split in XPLG)
+
+## 0) Pre-flight: stop shipper & pick one token
+
+```bash
+sudo systemctl stop fluent-bit
+```
+
+In XPLG:
+
+* **Listeners → HTTP → pick ONE account/token** (call it `TOKEN_ALL`).
+* Make sure **“group by source device/IP” is OFF** for that account.
+
+## 1) Create/normalize the three target Logs (all on the same token)
+
+Folders & Logs → choose parent folder (e.g. `Zigi-HTTP-App-logs`) → **Add Log** (three times):
+
+* **tomcat-access**
+* **tomcat-catalina**
+* **xplg-app**
+
+If you already have an IP-nested log (e.g. `…/10.0.0.85/tomcat-access 10.0.0.85`): **Move** it under `Zigi-HTTP-App-logs` and **rename** to `tomcat-access`, then delete empty IP subfolders.
+
+Bind all three logs to the **same HTTP account** (the one that shows `TOKEN_ALL`). The account should now show **Logs = 3**.
+
+## 2) Add “gate” rules so each Log keeps only its own files
+
+For **each** Log → **Edit Data → Active Log Pattern List** → **Add pattern**:
+
+* **tomcat-access** (Apply On: `file`, Action: **Keep on match**)
+
+  ```
+  .*/tomcat/localhost_access_log\.\d{4}-\d{2}-\d{2}\.txt$
+  ```
+
+* **tomcat-catalina** (Apply On: `file`, Keep on match)
+
+  ```
+  .*/tomcat/catalina\.\d{4}-\d{2}-\d{2}\.log$
+  ```
+
+* **xplg-app** (Apply On: `file`, Keep on match)
+
+  ```
+  .*/logs/app/XpoLogConsole\.log$
+  ```
+
+Put each **gate** as the **first** rule in its log so routing happens before parsing.
+
+## 3) Add per-log parsing (in XPLG, not in Fluent Bit)
+
+**tomcat-access** (Apply On: `Message`):
+
+```
+^(?<client_ip>\S+)\s+(?<ident>\S+)\s+(?<user>\S+)\s+\[(?<time>[^\]]+)\]\s+"(?<method>\S+)\s+(?<path>\S+)\s+(?<protocol>[^"]+)"\s+(?<status>\d{3})\s+(?<bytes>\S+)
+```
+
+**tomcat-catalina** (Apply On: `Message`):
+
+```
+^(?<ts>\d{2}-[A-Za-z]{3}-\d{4} \d{2}:\d{2}:\d{2}\.\d{3})\s+(?<level>[A-Z]+)\s+\[(?<thread>[^\]]+)\]\s+(?<logger>\S+)\s+(?<message>.*)
+```
+
+**xplg-app** (start simple; refine after a sample):
+
+```
+^(?<ts>\S+)\s+(?<message>.*)$
+```
+
+## 4) Fluent Bit: 3 inputs → **one** HTTP output (the shared token)
+
+Edit `/etc/fluent-bit/fluent-bit.conf` (no filters, no multiline):
+
+```ini
+[SERVICE]
+    Flush 1
+    Daemon Off
+    Log_Level info
+
+# -------- INPUTS (make sure Path_Key file is set) --------
+[INPUT]
+    Name tail
+    Path /home/xplg/xplg-single/logs/tomcat/localhost_access_log.*.txt
+    Tag  xplg.tomcat.access
+    DB   /var/lib/fluent-bit/tomcat-access.pos
+    Read_From_Head Off
+    Skip_Long_Lines On
+    Path_Key file
+
+[INPUT]
+    Name tail
+    Path /home/xplg/xplg-single/logs/tomcat/catalina.*.log
+    Tag  xplg.tomcat.catalina
+    DB   /var/lib/fluent-bit/tomcat-catalina.pos
+    Read_From_Head Off
+    Skip_Long_Lines On
+    Path_Key file
+
+[INPUT]
+    Name tail
+    Path /home/xplg/xplg-single/logs/app/*.log
+    Tag  xplg.app
+    DB   /var/lib/fluent-bit/xplg-app.pos
+    Read_From_Head Off
+    Skip_Long_Lines On
+    Path_Key file
+
+# -------- ONE HTTP OUTPUT (shared token) --------
+[OUTPUT]
+    Name http
+    Match_Regex ^xplg\.(tomcat\.(access|catalina)|app)$
+    Host 10.0.0.85
+    Port 30307
+    URI  /logeye/api/logger.jsp?token=TOKEN_ALL
+    Format json_lines
+    Json_Date_Key @timestamp
+    Json_Date_Format iso8601
+    Header Content-Type application/json
+    Retry_Limit False
+```
+
+> If your build lacks `Match_Regex`, use **two identical** http outputs with the same URI: one `Match xplg.tomcat.*`, one `Match xplg.app`.
+
+Start FB:
+
+```bash
+sudo mkdir -p /var/lib/fluent-bit
+sudo systemctl restart fluent-bit
+journalctl -u fluent-bit -n 100 --no-pager
+```
+
+## 5) Step-wise tests (verify after each)
+
+**Test A — access only**
+
+```bash
+TD="/home/xplg/xplg-single/logs/tomcat"
+D=$(date '+%d/%b/%Y:%H:%M:%S %z')
+printf '127.0.0.1 - - [%s] "GET /ONE_TOKEN_ACCESS_TEST HTTP/1.1" 200 2\n' "$D" \
+| sudo tee -a "$TD/localhost_access_log.$(date +%Y-%m-%d).txt" >/dev/null
+```
+
+Verify: Search → **log = tomcat-access** → find `/ONE_TOKEN_ACCESS_TEST`.
+Confirm it does **not** appear in the other two logs.
+
+**Test B — catalina only**
+
+```bash
+TS="$(date '+%d-%b-%Y %H:%M:%S.%3N')"
+echo "$TS INFO [main] ONE_TOKEN_CATALINA_TEST hello" \
+| sudo tee -a "$TD/catalina.$(date +%F).log" >/dev/null
+```
+
+Verify: Search → **log = tomcat-catalina** → find the line; not in others.
+
+**Test C — xplg-app only**
+
+```bash
+echo "ONE_TOKEN_XPLG_APP_TEST $(date -Is)" \
+| sudo tee -a "/home/xplg/xplg-single/logs/app/XpoLogConsole.log" >/dev/null
+```
+
+Verify: Search → **log = xplg-app** → find the line; not in others.
+
+**Listener check:** Listeners → HTTP → your chosen account should show **Logs = 3** and “Running”.
+
+---
+
+## Troubleshooting (fast)
+
+* **Nothing shows:** `Read_From_Head Off` → you must append new lines; check `journalctl -u fluent-bit -f` for HTTP retries.
+* **All events land in one log:** the **gate regex** is missing/too broad; fix the `file` rule in each log.
+* **Events land in two logs:** overlapping gates; tighten the regexes.
+* **No `file` field:** ensure each `[INPUT] tail` has `Path_Key file`.
+* **HTTP 200 but no events:** wrong account–log binding; ensure the **same token/account** is attached to **all three logs**.
+
+---
+
+# Terms: file vs. record vs. event
+
+* **log-some-file.log (file)**
+  A text file on your VM (e.g., `catalina.2025-09-18.log`). Fluent Bit **tails** it.
+
+* **record (Fluent Bit)**
+  A single unit the agent reads at a time (typically **one line** from the file). In our setup we don’t do multiline in FB, so each line = one record. Each record carries keys like `log` (the raw text) and `file` (source path).
+
+* **event (XPLG)**
+  The indexed unit inside XPLG’s store created from each incoming record. After your **gate** and **parsing** rules, XPLG saves fields and makes them searchable. In our config, **record ≈ event** (1:1) because we’re not stitching in the shipper.
+
+---
+
+If you want, paste the **exact** token you’ll use for `TOKEN_ALL` (redact most characters—leave 6–8 tailing chars), and I’ll return the final `[OUTPUT]` block with it in place so you can paste it without edits.
+
+
+You’re asking two things:
+
+1. does a “new entry” in a log file equal a log **record/event**?
+2. does a “new entry” mean **one line**?
+
+## Short, practical answer for **your current setup**
+
+* **Fluent Bit tail inputs + no multiline** (what you’re running) ⇒ **one newline-terminated line** appended to the file becomes **one Fluent Bit record** and therefore **one XPLG event**.
+* So yes: **new entry = one line = one record = one event**, *unless* you later turn on multiline **in XPLG** to merge related lines.
+
+## Important caveats (worth 30 seconds)
+
+* **No newline, no event:** if an app writes text without a trailing newline, Fluent Bit won’t emit it until a newline arrives (or the file is closed/rotated and the line is completed).
+* **Multiline (only if you enable it in XPLG):** if you configure multiline parsing in **XPLG**, several adjacent lines can be **merged into one event** (e.g., a Java stack trace). We’re currently **not** doing this in Fluent Bit.
+* **Batch writes:** if the app flushes 3 lines at once (each with its newline), you’ll still get **3 events**.
+* **Rotation & pos files:** we use `DB` pos files so lines aren’t resent after restarts. If you delete those pos files or unusual rotations happen, you *might* see duplicates.
+* **Two ingestion paths = duplicates:** if the same file is shipped via two outputs (e.g., HTTP and Syslog), you’ll see two events per line—by design.
+
+## 10-second verification (copy/paste)
+
+```bash
+# ACCESS: should create exactly 3 events
+TD="/home/xplg/xplg-single/logs/tomcat"
+D=$(date '+%d/%b/%Y:%H:%M:%S %z')
+for p in /a /b /c; do
+  printf '127.0.0.1 - - [%s] "GET %s HTTP/1.1" 200 2\n' "$D" "$p" \
+  | sudo tee -a "$TD/localhost_access_log.$(date +%Y-%m-%d).txt" >/dev/null
+done
+# In XPLG → log: tomcat-access → search /a OR /b OR /c → expect 3 events
+
+# CATALINA: one event
+TS="$(date '+%d-%b-%Y %H:%M:%S.%3N')"
+echo "$TS INFO [main] VERIFY_ONE_LINE_ONE_EVENT" \
+| sudo tee -a "$TD/catalina.$(date +%F).log" >/dev/null
+
+# NO NEWLINE behavior:
+echo -n "NO_NEWLINE_YET $(date -Is)" \
+| sudo tee -a "$TD/catalina.$(date +%F).log" >/dev/null   # (no event yet)
+echo "" | sudo tee -a "$TD/catalina.$(date +%F).log" >/dev/null             # now event appears
+```
+
+If you later decide to **merge stack traces** into single events, we’ll add **multiline rules in XPLG** (not Fluent Bit) so “many lines → one event” only for those patterns.

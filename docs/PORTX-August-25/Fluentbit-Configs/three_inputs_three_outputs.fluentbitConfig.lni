@@ -1,0 +1,94 @@
+ ### xplg@storm  ~  cat /etc/fluent-bit/fluent-bit.conf
+[SERVICE]
+    Flush        1
+    Daemon       Off
+    Log_Level    info
+
+# Tail host syslog (ship only)
+[INPUT]
+    Name              tail
+    Path              /var/log/syslog
+    Tag               host.syslog
+    DB                /var/lib/fluent-bit/host-syslog.pos
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+
+# --- Tomcat access ---
+[INPUT]
+    Name              tail
+    Path              /home/xplg/xplg-single/logs/tomcat/localhost_access_log.*.txt
+    Tag               xplg.tomcat.access
+    DB                /var/lib/fluent-bit/tomcat-access.pos
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+    Path_Key          file
+
+# --- Tomcat catalina ---
+[INPUT]
+    Name              tail
+    Path              /home/xplg/xplg-single/logs/tomcat/catalina.*.log
+    Tag               xplg.tomcat.catalina
+    DB                /var/lib/fluent-bit/tomcat-catalina.pos
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+    Path_Key          file
+# --- XPLG logs ---
+[INPUT]
+    Name  tail
+    Path  /home/xplg/xplg-single/logs/app/*.log
+    Tag   xplg.app
+    DB    /var/lib/fluent-bit/xplg-app.pos
+    Read_From_Head  Off
+    Skip_Long_Lines On
+    Path_Key        file
+
+# Send to XPLG Syslog TCP listener (compose maps host 1468 -> container 1468)
+[OUTPUT]
+    Name                   syslog
+    Match                  host.syslog
+    Host                   10.0.0.85
+    Port                   1468
+    Mode                   tcp
+    syslog_format          rfc5424
+    syslog_facility_preset user
+    syslog_severity_preset info
+    syslog_appname_preset  fluentbit
+    syslog_message_key     log
+
+# --- HTTP outputs (each stream -> its own token/log) ---
+[OUTPUT]
+    Name               http
+    Match              xplg.tomcat.catalina
+    Host               10.0.0.85
+    Port               30307
+    URI                /logeye/api/logger.jsp?token=671ca397-65e1-4caa-b340-2b248c014f30
+    Format             json_lines
+    Json_Date_Key      @timestamp
+    Json_Date_Format   iso8601
+    Header             Content-Type application/json
+    Retry_Limit        False
+
+[OUTPUT]
+    Name               http
+    Match              xplg.tomcat.access
+    Host               10.0.0.85
+    Port               30307
+    URI                /logeye/api/logger.jsp?token=1d74e7fb-8c98-4c69-88ff-b1aa8f694e7a
+    Format             json_lines
+    Json_Date_Key      @timestamp
+    Json_Date_Format   iso8601
+    Header             Content-Type application/json
+    Retry_Limit        False
+
+[OUTPUT]
+    Name   http
+    Match  xplg.app
+    Host   10.0.0.85
+    Port   30307
+    URI    /logeye/api/logger.jsp?token=682aa66f-67a4-49aa-a439-e094985487cf
+    Format json_lines
+    Json_Date_Key @timestamp
+    Json_Date_Format iso8601
+    Header Content-Type application/json
+    Retry_Limit False
+ 
