@@ -3397,3 +3397,3441 @@ If you do the three steps—fix the Syslog account port, drop the FB config abov
 one instance that work well as vm or docker only. setup syslog listner, http listener and then have fluentbit send log to it. and have the logs parsed and configured well on the folder and logs.
 9:50
 this need to be done by tommorw.
+
+totally—here’s the quick, practical rundown.
+
+# Syslog UDP vs Syslog TCP (what matters)
+
+**UDP (RFC 5426)**
+
+* **No connection/handshake** → very low overhead, low latency.
+* **Best-effort only** → packets can be **dropped, duplicated, or out of order**; sender doesn’t know.
+* **Message size** effectively limited by MTU (\~1500 bytes) unless IP fragmentation (frag loss hurts).
+* **Great for** lab/local host → collector, or noisy-but-not-critical telemetry.
+* **Back-pressure**: none; if receiver is slow, you just lose data.
+* **Firewalling**: simple (single port, stateless).
+
+**TCP (RFC 6587 framing)**
+
+* **Connected** stream → delivery with **ACKs, retransmit, ordering**.
+* **Back-pressure** works → if the collector slows, the sender blocks/buffers (protects data).
+* **Big messages** fine (no MTU issue).
+* **TLS (RFC 5425)** possible on top of TCP for encryption/auth.
+* **Overhead**: slightly higher (sessions, keepalives), but worth it for reliability.
+* **Great for** production or anything you must not lose.
+
+**What to pick here**
+
+* For your **local Fluent Bit → same host container**, UDP is fine for tests.
+* For **steady “don’t lose it” ingestion**, prefer **TCP** (or the **HTTP listener** you’re already using, which gives you a 200 response and generally reliable delivery).
+
+---
+
+# “When I edit the listener port in the UI, does it change the container port?”
+
+Short answer: **it changes what XPLG binds *inside* the container**, **it does not modify Docker’s port-publish rules**.
+
+Concretely:
+
+* XPLG (in the container) will listen on the **port number you set** in the UI (in that container’s network namespace).
+* Your Docker run/compose currently publishes **host 5514/udp and 5514/tcp → container 5514/udp and 5514/tcp**.
+* If you **change the syslog account to a different port** (say 1468) in the UI:
+
+  * The container now listens on **1468**.
+  * Your host is **still publishing 5514 → 5514**. Traffic to host:5514 won’t reach the new 1468 listener.
+  * Fix it by **either**:
+
+    1. Updating Docker to also publish **1468 (udp/tcp)** to the container, **or**
+    2. Pointing your sender (Fluent Bit) directly at the **container IP:1468** (e.g., 172.20.0.2:1468), **or**
+    3. Put the listener back on **5514** so it matches the existing mapping.
+
+> Note: TCP and UDP can share the **same numeric port** (e.g., 5514/tcp and 5514/udp) because they are different protocols. But **only one XPLG account per protocol per port** inside the container—two UDP accounts on 5514 will conflict and cause the “port not available” alert you saw.
+
+---
+
+## Quick sanity checks
+
+* See what’s actually listening **inside** the container:
+
+  ```bash
+  docker exec xplg-single sh -lc 'ss -lntup | egrep ":5514|:1468|:30303|:30443|:8088" || true'
+  ```
+* Verify host → container publish rules (you already did via `docker inspect`).
+* Test UDP send from host (lands in Syslog UDP account):
+
+  ```bash
+  echo "<134>$(date -u) host=$(hostname) msg=test-udp-5514" | nc -u -w1 127.0.0.1 5514
+  ```
+* Test TCP connectivity (for a Syslog TCP account on 5514):
+
+  ```bash
+  nc -vz 127.0.0.1 5514
+  ```
+
+If you want, I can sketch the exact changes if you decide to move your Syslog TCP account off 5514, but for tomorrow I’d keep:
+
+* **Syslog UDP** on **5514/udp** (matches compose),
+* **Syslog TCP** on **5514/tcp** (also matches compose), and
+* keep using the **HTTP listeners** for your two Fluent Bit streams (syslog tail + tomcat/app tail).
+
+
+---
+
+Nice change on the compose: `1468:5514/tcp` means **host:1468 → container:5514 (TCP)**, while UDP stays on host:5514. Inside the container XPLG should still bind **TCP 5514**.
+
+Here’s a clean way to verify the new **Syslog TCP on host:1468** end-to-end.
+
+# 0) Quick sanity checks
+
+**Inside the container (is XPLG listening on 5514/tcp?):**
+
+```bash
+docker exec xplg-single sh -lc 'ss -lnt | awk "{print \$4}" | egrep ":5514\$" || true'
+```
+
+**On the host (is the port published?):**
+
+```bash
+ss -lnt | awk '{print $4}' | egrep ':1468$' || true
+```
+
+You should see a LISTEN on each.
+
+# 1) Easiest functional test – `logger` over TCP
+
+Most Ubuntu systems have util-linux `logger` with TCP support:
+
+```bash
+logger --tcp --server 10.0.0.85 --port 1468 "test tcp-1468 $(date -Is)"
+```
+
+If your `logger` is older and lacks `--tcp`, skip to the netcat test below.
+
+# 2) Raw test with `nc` (netcat)
+
+Send a simple RFC3164-style line (many receivers accept line-delimited syslog over TCP):
+
+```bash
+printf "<134>%s %s fluentbit: test tcp-1468 via nc\n" "$(date '+%b %e %T')" "$(hostname)" \
+| nc -N 10.0.0.85 1468
+```
+
+If `-N` isn’t supported by your nc, use `-q1`.
+
+# 3) Test from the Docker network (isolates host firewall issues)
+
+```bash
+docker run --rm --network xplg-single_xplgnet alpine:3.19 sh -lc '
+  apk add --no-cache busybox-extras >/dev/null
+  printf "<134>%s %s alpine: test from docker net to container:1468\n" "$(date "+%b %e %T")" "$(hostname)" \
+  | nc -q1 xplg-single 1468'
+```
+
+# 4) Verify in XPLG UI
+
+* Go to **Listen to Data → Syslog TCP** account (the one that binds 5514/tcp in the container).
+* The “Logs” count should increment.
+* Open **Search** and look for: `test tcp-1468` or `fluentbit:` or `alpine:` depending on which test you ran.
+
+# 5) (Optional) Point Fluent Bit to TCP 1468
+
+If you want your Fluent Bit stream to use TCP as well:
+
+```ini
+[OUTPUT]
+    Name              syslog
+    Match             host.syslog
+    Host              10.0.0.85
+    Port              1468
+    Mode              tcp
+    Syslog_Format     rfc5424
+    Syslog_Message_Key log
+```
+
+> Tip: If you keep **both** HTTP and Syslog outputs matching the same tag, you’ll ingest duplicates (one via each path). Either:
+>
+> * keep both intentionally (two different parsing/playbooks), or
+> * split tags (e.g., `Match  host.syslog` for HTTP and `Match  host.syslog.tcp` for Syslog) and route inputs with a `Tag` per input.
+
+# 6) If it doesn’t work
+
+* The XPLG alert “port 5514 … not available” = **another Syslog account already bound to that port (protocol)** inside the container. Ensure you have **only one** Syslog **TCP** account on 5514 (UDP can also use 5514 separately).
+* Rerun the container after compose edits: `docker compose up -d` (you already did, but worth noting).
+* Re-check container logs:
+
+  ```bash
+  docker exec xplg-single sh -lc \
+    'tail -n 300 /opt/xplg-service/log/XpoLogConsole.log /opt/xplg-service/ServletContainer/logs/catalina.*.log | egrep -i "syslog|bind|port|started|error" || true'
+
+
+  docker exec xplg-single sh -lc \
+    'tail -n 300 /opt/xplg-service/log/XpoLogConsole.log /opt/xplg-service/ServletContainer/logs/catalina.*.log | egrep -i "syslog|bind|port|started|error" || true'
+  ```
+
+That’s it—run the `logger` test first; it’s the quickest proof your **host:1468 → container:5514/tcp → XPLG Syslog TCP** path is good.
+
+
+---
+
+Great catch — two things were biting you at once:
+
+1. The `nc` in Alpine’s **busybox** doesn’t support `-N` or `-q`.
+2. In your `docker run --network xplg-single_xplgnet ...` test you targeted **xplg-single:1468**, but 1468 is the **host** port. Inside the Docker network, the XPLG container listens on **5514/tcp**. Use `xplg-single:5514` there (or use `10.0.0.85:1468` to hit the host mapping).
+
+Use any of the working variants below.
+
+---
+
+## A) Test from the Docker network to the **container port 5514**
+
+(Install OpenBSD netcat so `-N` works, and hit the service name)
+
+```bash
+docker run --rm --network xplg-single_xplgnet alpine:3.19 sh -lc '
+  apk add --no-cache netcat-openbsd >/dev/null
+  printf "<134>%s %s alpine: test to container:5514\n" "$(date "+%b %e %T")" "$(hostname)" \
+  | nc -N xplg-single 5514
+'
+```
+
+## B) Test from the Docker network to the **host port 1468**
+
+(Also fine — this exercises the port mapping)
+
+```bash
+docker run --rm --network xplg-single_xplgnet alpine:3.19 sh -lc '
+  apk add --no-cache netcat-openbsd >/dev/null
+  printf "<134>%s %s alpine: test to host:1468\n" "$(date "+%b %e %T")" "$(hostname)" \
+  | nc -N 10.0.0.85 1468
+'
+```
+
+## C) If you want to stick with BusyBox `nc` (no `-N`/`-q`)
+
+Use a timeout and BusyBox’s `-w`:
+
+```bash
+docker run --rm --network xplg-single_xplgnet alpine:3.19 sh -lc '
+  apk add --no-cache busybox-extras >/dev/null
+  timeout 2 sh -c "printf \"<134>%s %s busybox test to container:5514\n\" \"\$(date \"+%b %e %T\")\" \"\$(hostname)\" | nc -w1 xplg-single 5514"
+'
+```
+
+## D) Quick host-side test with `logger`
+
+(Exercises host:1468 → container:5514/tcp)
+
+```bash
+logger --tcp --server 10.0.0.85 --port 1468 "test tcp-1468 $(date -Is)"
+```
+
+---
+
+### Verify in XPLG
+
+* Open **Listen to Data → Syslog TCP** account (the one bound to 5514/tcp in the container).
+* The **Logs** count should tick up.
+* In **Search**, look for `alpine: test` or `test tcp-1468`.
+
+If it still doesn’t land, double-check:
+
+* Only **one** Syslog **TCP** listener is bound to 5514 inside the container (that “Critical syslog failure … port 5514 … not available” usually means a duplicate bind).
+* Host and container ports are present:
+
+  * Host: `ss -lnt | egrep ':1468$'`
+  * Container: `docker exec xplg-single sh -lc 'ss -lnt | egrep ":5514$" || true'`
+
+This should get your TCP path green.
+can you generate a concise msg for me to be used as instructions to (you) in a new chat so we can have clean env (especially for your env) so that the response time is normal . (very slow curently)
+
+
+##### new chat context
+
+Here’s a clean, concise starter message you can paste into a new chat:
+
+---
+
+**Project context (please read and act):**
+
+* **Goal (due end of day):** One XPLG instance (Docker) that reliably ingests logs via **Syslog UDP+TCP** and an **HTTP listener**, with **parsing done in XPLG** (not Fluent Bit). Fluent Bit on the VM tails sources and forwards to XPLG. We want steady, continuous log flow and simple validation steps.
+
+* **Environment:**
+
+  * Container name `xplg-single`, network `xplg-single_xplgnet`.
+  * Host ↔ container ports: `30307→30303` (UI HTTP), `30447→30443` (UI HTTPS), `5514/udp→5514/udp` (Syslog UDP), `1468/tcp→1468/tcp` .
+  * Volumes: `/home/xplg/xplg-single/data → /home/data`, Tomcat logs → `/opt/xplg-service/ServletContainer/logs`, app logs → `/opt/xplg-service/log`, `/incoming → /incoming`.
+  * Host IP to target from Fluent Bit: **10.0.0.85**.
+  * XPLG has: Syslog UDP 5514, Syslog TCP 5514, HTTP listener  on port **30307** via token endpoint `/logeye/api/logger.jsp?token=<TOKEN>` .
+
+* **Fluent Bit (systemd on VM):** Running and will tail:
+
+  1. `/var/log/syslog`
+  2. Tomcat: `/home/xplg/xplg-single/logs/tomcat/catalina.*.log`, `localhost_access_log.*.txt`
+  3. XPLG app: `/home/xplg/xplg-single/logs/app/XpoLogConsole.log`
+     Outputs:
+
+  * **Syslog UDP →** `10.0.0.85:5514` (facility/user, rfc5424)
+  * **HTTP →** `http://10.0.0.85:30307/logeye/api/logger.jsp?token=<TOKEN>` (json\_lines)
+
+**What I want from you now:**
+
+1. Provide the exact Fluent Bit config blocks for those 3 inputs and the 3 outputs (including robust `DB` pos files, `Multiline` for Tomcat if needed, and tags).
+2. Give copy-paste commands to deploy/reload Fluent Bit and quick verifications (journalctl, curl, nc/logger tests).
+3. In XPLG, list the minimal steps to: create/select target **Folder** and **Logs** for each stream, associate parsers (using XPLG parsers, not Fluent Bit), and confirm ingestion in Search.
+4. Add a short troubleshooting checklist for common failures (port binds, token/HTTP 200s but no events, multiline not stitching, etc.).
+5. Keep answers **concise**, step-by-step, with exact commands/paths. **Do not browse the web** unless I ask. Assume sensible defaults; don’t ask me clarifying questions unless blocking.
+
+
+---
+
+
+You want: **(1)** exact Fluent Bit configs for 3 inputs and 3 outputs (Syslog UDP/TCP + HTTP), with robust pos DB and Tomcat multiline; **(2)** copy-paste deploy/reload + quick checks; **(3)** minimal XPLG steps to create/select Folder/Logs, attach XPLG parsers, and confirm in Search; **(4)** a short troubleshooting checklist. No web browsing. Concise, copy-paste friendly.
+
+---
+
+# 1) Fluent Bit config (inputs, outputs, multiline)
+
+> Paths & assumptions (edit if needed):
+>
+> * Fluent Bit config dir: `/etc/fluent-bit/`
+> * State DB dir: `/var/lib/fluent-bit/db` (make sure it exists and is writable)
+> * Host IP of XPLG: `10.0.0.85`
+> * XPLG HTTP token: replace `REPLACE_WITH_TOKEN`
+
+## `/etc/fluent-bit/fluent-bit.conf`
+
+```ini
+[SERVICE]
+    Flush              1
+    Daemon             Off
+    Log_Level          info
+    Parsers_File       /etc/fluent-bit/parsers_multiline.conf
+    HTTP_Server        On
+    HTTP_Listen        0.0.0.0
+    HTTP_Port          2020
+    storage.path       /var/lib/fluent-bit/storage
+    storage.sync       normal
+    storage.backlog.mem_limit 64M
+
+# ------------ INPUTS ------------
+
+# 1) /var/log/syslog
+[INPUT]
+    Name                tail
+    Tag                 syslog.tail
+    Path                /var/log/syslog
+    DB                  /var/lib/fluent-bit/db/syslog.db
+    DB.Sync             Normal
+    Read_From_Head      Off
+    Skip_Long_Lines     On
+    Refresh_Interval    5
+    Path_Key            file
+
+# 2) Tomcat: catalina.*.log (enable Java multiline)
+[INPUT]
+    Name                tail
+    Tag                 tomcat.catalina.tail
+    Path                /home/xplg/xplg-single/logs/tomcat/catalina.*.log
+    DB                  /var/lib/fluent-bit/db/tomcat_catalina.db
+    DB.Sync             Normal
+    Read_From_Head      Off
+    Skip_Long_Lines     On
+    multiline.parser    tomcat_multiline
+    Path_Key            file
+
+# 2b) Tomcat access logs: one line per request
+[INPUT]
+    Name                tail
+    Tag                 tomcat.access.tail
+    Path                /home/xplg/xplg-single/logs/tomcat/localhost_access_log.*.txt
+    DB                  /var/lib/fluent-bit/db/tomcat_access.db
+    DB.Sync             Normal
+    Read_From_Head      Off
+    Skip_Long_Lines     On
+    Path_Key            file
+
+# 3) XPLG app log
+[INPUT]
+    Name                tail
+    Tag                 xplg.app.tail
+    Path                /home/xplg/xplg-single/logs/app/XpoLogConsole.log
+    DB                  /var/lib/fluent-bit/db/xplg_app.db
+    DB.Sync             Normal
+    Read_From_Head      Off
+    Skip_Long_Lines     On
+    # If the app sometimes prints Java stack traces, keep the same multiline parser:
+    multiline.parser    tomcat_multiline
+    Path_Key            file
+
+# ------------ OUTPUTS ------------
+
+# A) Syslog UDP -> 10.0.0.85:5514
+[OUTPUT]
+    Name                syslog
+    Match               *.tail
+    Host                10.0.0.85
+    Port                5514
+    Mode                udp
+    Syslog_Format       rfc5424
+    Syslog_Facility     user
+    Syslog_Severity     info
+    Syslog_Appname      fluentbit
+    Retry_Limit         False
+
+# B) Syslog TCP -> 10.0.0.85:5514
+[OUTPUT]
+    Name                syslog
+    Match               *.tail
+    Host                10.0.0.85
+    Port                5514
+    Mode                tcp
+    Syslog_Format       rfc5424
+    Syslog_Facility     user
+    Syslog_Severity     info
+    Syslog_Appname      fluentbit
+    Retry_Limit         False
+
+# C) HTTP -> http://10.0.0.85:30307/logeye/api/logger.jsp?token=<TOKEN>
+#    Sends newline-delimited JSON (one record per line).
+[OUTPUT]
+    Name                http
+    Match               *.tail
+    Host                10.0.0.85
+    Port                30307
+    URI                 /logeye/api/logger.jsp?token=REPLACE_WITH_TOKEN
+    Format              json_lines
+    Json_Date_Key       @timestamp
+    Json_Date_Format    iso8601
+    Header              Content-Type application/json
+    compress            off
+    Retry_Limit         False
+```
+
+## `/etc/fluent-bit/parsers_multiline.conf`
+
+```ini
+# Tomcat/JVM stack traces: a new record starts when the line begins with date like:
+# 18-Sep-2025 12:34:56.789 ...
+[MULTILINE_PARSER]
+    Name          tomcat_multiline
+    Type          regex
+    Flush_Timeout 1000
+    # First line:  DD-Mmm-YYYY HH:MM:SS.mmm <anything>
+    Rule          "start_state" "/^\\d{2}-[A-Za-z]{3}-\\d{4} \\d{2}:\\d{2}:\\d{2}\\.\\d{3} .*/" "cont"
+    # Continuation: any line that does NOT start with the above timestamp
+    Rule          "cont" "/^(?!\\d{2}-[A-Za-z]{3}-\\d{4} \\d{2}:\\d{2}:\\d{2}\\.\\d{3} ).+/" "cont"
+```
+
+> Notes
+>
+> * All inputs are matched to **all three** outputs. If you prefer isolating streams (e.g., syslog file → syslog only, Tomcat/app → HTTP only), change each `[OUTPUT] Match` to specific tags (`syslog.tail`, `tomcat.*.tail`, `xplg.app.tail`).
+> * `json_lines` ensures one JSON object per line, which works well with the XPLG HTTP logger endpoint.
+> * DB files ensure robust tailing across restarts.
+
+---
+
+# 2) Deploy, reload, and quick verifications
+
+## Create dirs & put configs
+
+```bash
+sudo mkdir -p /etc/fluent-bit /var/lib/fluent-bit/db /var/lib/fluent-bit/storage
+sudo tee /etc/fluent-bit/fluent-bit.conf >/dev/null <<'EOF'
+# paste the fluent-bit.conf from above
+EOF
+
+sudo tee /etc/fluent-bit/parsers_multiline.conf >/dev/null <<'EOF'
+# paste the parsers_multiline.conf from above
+EOF
+```
+
+## Dry-run config test (optional)
+
+```bash
+sudo fluent-bit -c /etc/fluent-bit/fluent-bit.conf -t
+```
+
+## Start/Reload (systemd)
+
+```bash
+sudo systemctl enable --now fluent-bit
+sudo systemctl restart fluent-bit
+sudo systemctl status --no-pager -l fluent-bit
+journalctl -u fluent-bit -n 200 --no-pager
+journalctl -u fluent-bit -f
+```
+
+## Quick functional checks
+
+**Write test events to each tailed source:**
+
+```bash
+# 1) /var/log/syslog via logger (best practice)
+logger "FB TEST syslog $(date -Is)"
+
+# 2) Tomcat catalina log (+ one fake stacktrace to test multiline)
+ts="$(date '+%d-%b-%Y %H:%M:%S.%3N')"
+logdir="/home/xplg/xplg-single/logs/tomcat"
+sudo bash -c "echo '$ts INFO [main] Test entry from Fluent Bit' >> $logdir/catalina.$(date +%F).log"
+sudo bash -c "printf '%s ERROR [main] Simulated exception\njava.lang.RuntimeException: boom\n\tat com.example.App.main(App.java:1)\n' \"$ts\" >> $logdir/catalina.$(date +%F).log"
+
+# 3) XPLG app log
+sudo bash -c "echo 'FB TEST xplg app $(date -Is)' >> /home/xplg/xplg-single/logs/app/XpoLogConsole.log"
+```
+
+**Confirm Fluent Bit is shipping:**
+
+```bash
+# Follow the Fluent Bit service logs for deliveries and any errors
+journalctl -u fluent-bit -f
+```
+
+**Direct HTTP endpoint sanity check (token & endpoint OK):**
+
+```bash
+curl -v -X POST \
+  -H 'Content-Type: application/json' \
+  --data-binary '{"message":"manual curl check","source":"sanity","ts":"'"$(date -Is)"'"}' \
+  'http://10.0.0.85:30307/logeye/api/logger.jsp?token=REPLACE_WITH_TOKEN'
+```
+
+**(Optional) Network visibility from VM:**
+
+```bash
+# UDP syslog traffic leaving VM
+sudo tcpdump -nn -i any udp port 5514
+
+# TCP syslog connection attempts
+sudo tcpdump -nn -i any tcp port 5514
+```
+
+---
+
+# 3) XPLG minimal UI steps (Folder, Logs, parsers, verify)
+
+1. **Log in** to XPLG UI: `http://10.0.0.85:30307/` (HTTP mapped to container’s 30303).
+2. **Create Folder**: e.g., **FB-POC**.
+3. **Create three Logs (destinations)** under **FB-POC**:
+
+   * **Syslog UDP (5514)** → Log name: `syslog-udp`. **Parser:** *Syslog RFC5424*.
+   * **Syslog TCP (5514)** → Log name: `syslog-tcp`. **Parser:** *Syslog RFC5424*.
+   * **HTTP Logger (token)** → Log name: `http-json`. **Parser:** *JSON* (XPLG JSON parser).
+
+   > Ensure the **token** you use in Fluent Bit is associated with folder **FB-POC** / log **http-json** (Token Manager / Logger Tokens).
+4. **Confirm ingestion**:
+
+   * Open **Search** → select **FB-POC** (or individual logs) → **Last 5 minutes** → run.
+   * You should see:
+
+     * `FB TEST syslog ...` in `syslog-udp` / `syslog-tcp`.
+     * Tomcat `Test entry` and the **stacktrace collapsed into a single event** (multiline).
+     * `FB TEST xplg app ...` and `manual curl check` in `http-json`.
+
+---
+
+# 4) Short troubleshooting checklist
+
+**Ports & binds**
+
+* Host: `sudo ss -lntup '( sport = :30307 or sport = :5514 )'`
+* Container: `docker exec -it xplg-single ss -lntup` (verify internal listeners).
+* Docker mapping: `docker ps --format '{{.Names}} -> {{.Ports}}' | grep xplg-single`
+
+**Fluent Bit state/DB**
+
+* DB path exists & writable: `/var/lib/fluent-bit/db/*`
+* If files rotated and tail stalls, restart service; as a last resort: `sudo systemctl stop fluent-bit && sudo rm -f /var/lib/fluent-bit/db/*.db && sudo systemctl start fluent-bit`
+
+**HTTP 200 but no events in XPLG**
+
+* Token not mapped to the right Folder/Log → fix in **Logger Tokens**.
+* Payload must be **one JSON object per line**; `Format json_lines` ensures that.
+* Parser mismatch → ensure **JSON** parser for the HTTP log.
+
+**No syslog events**
+
+* Firewall on host/container blocking 5514.
+* Use tcpdump to confirm packets arrive: `sudo tcpdump -nn -i any udp port 5514` / `tcp port 5514`.
+* Parser mismatch → ensure **Syslog RFC5424** parser is selected.
+
+**Multiline not stitching**
+
+* Verify `multiline.parser tomcat_multiline` is present on the *catalina* and *xplg app* inputs.
+* Timestamp regex fits your Tomcat pattern (`DD-Mmm-YYYY HH:MM:SS.mmm …`). Adjust if your format differs.
+* Increase `Flush_Timeout` (e.g., 2000–3000 ms) if stacks are split by delays.
+
+**General**
+
+* Tail starts from end by default (`Read_From_Head Off`). To backfill **once**, temporarily set `Read_From_Head On`, restart, then set it back and restart again.
+
+---
+
+If you want me to narrow Matches so each input goes to specific outputs (to avoid duplication across logs), say the word and I’ll give you the minimal `Match` matrix.
+You’re asking me to confirm whether your **docker-compose** gives XPLG access to the three ingestion paths (Syslog UDP, Syslog TCP, HTTP token endpoint) and to the three local log sources (Tomcat logs, XPLG app logs, optional “incoming” dir) — and call out anything missing or mismatched, with exact fixups/commands.
+
+### Verdict (short):
+
+* **Yes** — your compose exposes all three listeners and mounts the three local log sources correctly.
+* One alignment to remember for Fluent Bit: **Syslog TCP is on port 1468/tcp (not 5514/tcp)** per your compose; **Syslog UDP is 5514/udp**; the **HTTP token endpoint rides on the UI HTTP port** (host **30307 → container 30303**), so sending HTTP to `http://10.0.0.85:30307/logeye/api/logger.jsp?token=...` is correct. The extra `8088:8088` mapping is optional unless you intentionally use it.&#x20;
+
+---
+
+# What the compose gives you (mapped to your goals)
+
+* **Listeners**
+
+  * **UI HTTP**: `30307:30303` → HTTP token endpoint under `/logeye/api/logger.jsp?...` is reachable at **`http://10.0.0.85:30307/...`**.&#x20;
+  * **UI HTTPS**: `30447:30443`.&#x20;
+  * **Syslog UDP**: `5514:5514/udp`. **Target from Fluent Bit:** `10.0.0.85:5514/udp`.&#x20;
+  * **Syslog TCP**: `1468:1468/tcp`. **Target from Fluent Bit:** `10.0.0.85:1468/tcp`.&#x20;
+  * **(Optional) HTTP 8088**: `8088:8088/tcp` — not required for the token endpoint if you use the UI port; keep only if you plan to listen there too.&#x20;
+
+* **Local log access (mounted into standard XPLG paths)**
+
+  * **Tomcat logs** (host `/home/xplg/xplg-single/logs/tomcat`) → container `/opt/xplg-service/ServletContainer/logs`.&#x20;
+  * **XPLG app logs** (host `/home/xplg/xplg-single/logs/app`) → container `/opt/xplg-service/log`.&#x20;
+  * **Drop-in folder** (host `/home/xplg/xplg-single/incoming`) → container `/incoming`.&#x20;
+  * **Persistent data** mapped to `/home/data` (via `sharedstorage` + inception params).&#x20;
+
+---
+
+# Minimal corrections to the Fluent Bit blocks (to match your compose)
+
+If you used my earlier sample, adjust only the **Syslog TCP output** and keep HTTP pointing at **30307**:
+
+```ini
+# Syslog UDP (unchanged)
+[OUTPUT]
+    Name    syslog
+    Match   *.tail
+    Host    10.0.0.85
+    Port    5514
+    Mode    udp
+    Syslog_Format rfc5424
+    Syslog_Facility user
+    Syslog_Severity info
+    Syslog_Appname  fluentbit
+    Retry_Limit False
+
+# Syslog TCP (align with compose: 1468/tcp)
+[OUTPUT]
+    Name    syslog
+    Match   *.tail
+    Host    10.0.0.85
+    Port    1468
+    Mode    tcp
+    Syslog_Format rfc5424
+    Syslog_Facility user
+    Syslog_Severity info
+    Syslog_Appname  fluentbit
+    Retry_Limit False
+
+# HTTP token endpoint via UI HTTP port mapping (30307 -> 30303)
+[OUTPUT]
+    Name    http
+    Match   *.tail
+    Host    10.0.0.85
+    Port    30307
+    URI     /logeye/api/logger.jsp?token=REPLACE_WITH_TOKEN
+    Format  json_lines
+    Json_Date_Key    @timestamp
+    Json_Date_Format iso8601
+    Header  Content-Type application/json
+    compress off
+    Retry_Limit False
+```
+
+> If you decide to actually use **8088** as the HTTP ingestion port in XPLG, then set `Port 8088` and ensure the XPLG service is listening there. Otherwise you can drop the 8088 mapping from compose to reduce noise.&#x20;
+
+---
+
+# Fast validation on the host
+
+```bash
+# Check container port bindings match expectations
+docker ps --format '{{.Names}} -> {{.Ports}}' | grep xplg-single
+
+# See listeners inside the container
+docker exec -it xplg-single ss -lntup
+
+# Hit HTTP token endpoint (replace token)
+curl -v -X POST -H 'Content-Type: application/json' \
+  --data-binary '{"msg":"compose check","ts":"'"$(date -Is)"'"}' \
+  'http://10.0.0.85:30307/logeye/api/logger.jsp?token=REPLACE_WITH_TOKEN'
+
+# Quick wire checks
+sudo tcpdump -nn -i any udp port 5514 -c 5
+sudo tcpdump -nn -i any tcp port 1468 -c 5
+```
+
+---
+
+## Bottom line
+
+* Your compose is **sufficient** for the 3 ingestion methods **and** for local log access.
+* Just **point Fluent Bit TCP Syslog to 1468/tcp**, keep **UDP on 5514/udp**, and **send HTTP to 30307** with the token path. That aligns everything perfectly.&#x20;
+
+If you want, I can also give you a version of the Fluent Bit outputs where each input goes to a specific destination (e.g., syslog → syslog-only, Tomcat/app → HTTP-only) to avoid duplicate events.
+
+
+
+You’re asking me to: (1) explain exactly what those commands do; (2) give a version of Fluent Bit outputs that avoids duplicates by routing **syslog → syslog only** and **Tomcat/app → HTTP only**; (3) review your current Fluent Bit config and call out any tweaks; and (4) add a small visual to keep handy. I’ll keep this step-by-step and only rely on your compose file.&#x20;
+
+---
+
+# 1) What those two commands do
+
+* `docker ps --format '{{.Names}} -> {{.Ports}}' | grep xplg-single`
+  Lists running containers, prints just `Name -> Ports` with a Go template, then filters to the `xplg-single` line. It confirms which **host ports** are published to which **container ports** (e.g., `30307->30303/tcp`, `5514->5514/udp`, `1468->1468/tcp`, `8088->8088/tcp`). This is how you verified your listeners are exposed as expected.
+
+* `cat /etc/fluent-bit/fluent-bit.conf`
+  Prints your Fluent Bit config so you (or I) can review the exact inputs/outputs/tags and ensure they align with the published ports and the XPLG HTTP token endpoint.
+
+---
+
+# 2) Outputs with no duplicates (syslog → syslog only; Tomcat/app → HTTP only)
+
+Given your **tags**:
+
+* `host.syslog` (Linux host syslog)
+* `xplg.tomcat.catalina` (Tomcat catalina)
+* `xplg.tomcat.access` (Tomcat access)
+* `xplg.app` (XPLG app logs)
+
+Replace **only your outputs** with the following so each input goes to exactly one destination:
+
+```ini
+# ========== OUTPUTS (deduplicated) ==========
+
+# A) Send ONLY the host syslog to XPLG Syslog (UDP 5514)
+[OUTPUT]
+    Name               syslog
+    Match              host.syslog
+    Host               10.0.0.85
+    Port               5514
+    Mode               udp
+    Syslog_Format      rfc5424
+    Syslog_Facility    user
+    Syslog_Severity    info
+    Syslog_Appname     fluentbit
+    # tail input uses key "log" by default; this becomes the syslog MSG
+    Syslog_Message_Key log
+
+# (Optional) If you also want a TCP path for syslog, add this but keep the same Match:
+# [OUTPUT]
+#     Name               syslog
+#     Match              host.syslog
+#     Host               10.0.0.85
+#     Port               1468
+#     Mode               tcp
+#     Syslog_Format      rfc5424
+#     Syslog_Facility    user
+#     Syslog_Severity    info
+#     Syslog_Appname     fluentbit
+#     Syslog_Message_Key log
+
+# B) Send ONLY Tomcat + app logs over HTTP token endpoint via the UI mapping (30307->30303)
+[OUTPUT]
+    Name               http
+    Match              xplg.tomcat.*   # both catalina and access
+    Host               10.0.0.85
+    Port               30307
+    URI                /logeye/api/logger.jsp?token=671ca397-65e1-4caa-b340-2b248c014f30
+    Format             json_lines
+    Json_Date_Key      @timestamp
+    Json_Date_Format   iso8601
+    Header             Content-Type application/json
+
+[OUTPUT]
+    Name               http
+    Match              xplg.app
+    Host               10.0.0.85
+    Port               30307
+    URI                /logeye/api/logger.jsp?token=671ca397-65e1-4caa-b340-2b248c014f30
+    Format             json_lines
+    Json_Date_Key      @timestamp
+    Json_Date_Format   iso8601
+    Header             Content-Type application/json
+```
+
+Why this works with your compose:
+
+* **Syslog UDP** listener is published at **5514/udp** → route `host.syslog` there.
+* **HTTP token endpoint** is reachable via the UI HTTP mapping **30307→30303** → route Tomcat/app there.
+* **Syslog TCP** is on **1468/tcp** if you later want a TCP path for syslog; keep it commented for now to avoid duplicates.&#x20;
+
+---
+
+# 3) Review of your current Fluent Bit config (what’s good, what to tweak)
+
+**Good / aligned**
+
+* Tags are clear and let us match per-stream (`host.syslog`, `xplg.tomcat.*`, `xplg.app`).
+* DB pos files are set for each input — great for robustness.
+* Syslog output uses `Syslog_Message_Key log` — correct for `tail` input.
+* HTTP output points at **10.0.0.85:30307** with token path — correct with your port mapping.&#x20;
+
+**Recommended tweaks**
+
+1. **Avoid duplicates**: your current `[OUTPUT]` for `http` uses `Match xplg.*` (good), and your `syslog` output uses `Match host.syslog` (also good). You’re **already deduped** as long as you **don’t** also add a second syslog output that matches `xplg.*`. The snippet I gave above just makes that intent explicit and future-proof.
+
+2. **Tomcat multiline (optional but helpful):**
+   If catalina logs can include Java stack traces, add a multiline parser and reference it on the catalina (and possibly app) inputs.
+
+Add to (or create) `/etc/fluent-bit/parsers.conf`:
+
+```ini
+[MULTILINE_PARSER]
+    Name          tomcat_multiline
+    Type          regex
+    Flush_Timeout 2000
+    Rule          "start_state" "/^\\d{2}-[A-Za-z]{3}-\\d{4} \\d{2}:\\d{2}:\\d{2}\\.\\d{3} .*/" "cont"
+    Rule          "cont" "/^(?!\\d{2}-[A-Za-z]{3}-\\d{4} \\d{2}:\\d{2}:\\d{2}\\.\\d{3} ).+/" "cont"
+```
+
+Then on your catalina (and optional app) inputs:
+
+```ini
+multiline.parser  tomcat_multiline
+```
+
+> You already have `Parsers_File parsers.conf`, so adding the block above is enough.
+
+3. **Date field key on HTTP:**
+   You used `Json_Date_Key  date`. That’s fine if you prefer `date`. I switched to `@timestamp` in my example (common convention). Either works — just be consistent across your HTTP outputs.
+
+4. **Memory limits**: your `Mem_Buf_Limit` per input is fine. If you see backpressure, bump Tomcat’s (already 50MB) or enable on-disk storage (SERVICE `storage.path`) later.
+
+**Reload safely**
+
+```bash
+sudo systemctl restart fluent-bit
+journalctl -u fluent-bit -n 100 --no-pager
+```
+
+**Quick sanity**
+
+```bash
+# syslog path only:
+logger "FB TEST syslog $(date -Is)"
+
+# tomcat catalina (single + stacktrace):
+ts="$(date '+%d-%b-%Y %H:%M:%S.%3N')"
+logdir="/home/xplg/xplg-single/logs/tomcat"
+sudo bash -c "echo '$ts INFO [main] Test entry' >> $logdir/catalina.$(date +%F).log"
+sudo bash -c "printf '%s ERROR [main] Boom\njava.lang.RuntimeException: boom\n\tat x.y.z(App.java:1)\n' \"$ts\" >> $logdir/catalina.$(date +%F).log"
+```
+
+---
+
+# 4) Handy visual (host → Fluent Bit → XPLG)
+
+```
++--------------------+             +----------------+             +------------------------------+
+|   Linux Host       |             |   Fluent Bit   |             |     XPLG (xplg-single)       |
+|  /var/log/syslog   |  tail       |  Inputs:       |   Syslog    |  Syslog UDP listener         |
+|                    +-----------> |  host.syslog   +-----------> |  10.0.0.85:5514/udp          |
+|  Tomcat catalina   |  tail       |                |             |  (RFC5424 parser on Log)     |
+|  catalina.*.log    +-----------> |  xplg.tomcat.* |    HTTP     |                              |
+|  access_log.*.txt  |  tail       |                +-----------> |  HTTP token endpoint         |
+|                    |             |  xplg.app      |  json_lines |  http://10.0.0.85:30307/    |
+|  XpoLogConsole.log +-----------> |                |             |  /logeye/api/logger.jsp?...  |
++--------------------+             +----------------+             +------------------------------+
+                                                                   |
+                                                                   +-- Folder: FB-POC
+                                                                       ├─ Log: syslog-udp  (parser: Syslog RFC5424)
+                                                                       ├─ Log: http-json   (parser: JSON)
+                                                                       └─ (optional) syslog-tcp if you enable 1468/tcp
+```
+
+Yes, it makes sense to keep this kind of sketch: it’s perfect for spotting duplication, mismatched ports, or parser assignments at a glance.
+
+---
+
+## Bottom line
+
+* Your compose exposes the right listeners and mounts; keep sending **HTTP to 30307**, **UDP syslog to 5514**, and (optionally) **TCP syslog to 1468**.&#x20;
+* With the per-tag **Match** rules above, each stream goes to a single destination (no duplicates).
+* Consider adding the Tomcat multiline parser for cleaner stacktraces in XPLG Search.
+
+
+```bash
+
+ xplg@storm  ~  cat /etc/fluent-bit/fluent-bit.conf                              
+[SERVICE]
+    Flush        1
+    Daemon       Off
+    Log_Level    info
+    Parsers_File parsers.conf
+
+# ========== INPUTS ==========
+# System syslog (Linux host)
+[INPUT]
+    Name              tail
+    Path              /var/log/syslog
+    Tag               host.syslog
+    Skip_Long_Lines   On
+    Refresh_Interval  5
+    DB                /var/lib/fluent-bit/syslog.pos
+    Mem_Buf_Limit     10MB
+
+# Tomcat catalina logs (from the container, bind-mounted on the host)
+[INPUT]
+    Name              tail
+    Path              /home/xplg/xplg-single/logs/tomcat/catalina.*.log
+    Path_Key          path
+    Tag               xplg.tomcat.catalina
+    Skip_Long_Lines   On
+    Refresh_Interval  5
+    DB                /var/lib/fluent-bit/xplg-catalina.pos
+    Mem_Buf_Limit     50MB
+
+# Tomcat access logs (optional, if present)
+[INPUT]
+    Name              tail
+    Path              /home/xplg/xplg-single/logs/tomcat/localhost_access_log.*.txt
+    Path_Key          path
+    Tag               xplg.tomcat.access
+    Skip_Long_Lines   On
+    Refresh_Interval  5
+    DB                /var/lib/fluent-bit/xplg-access.pos
+    Mem_Buf_Limit     20MB
+
+# XPLG application logs (inside container, bind-mounted to host)
+[INPUT]
+    Name              tail
+    Path              /home/xplg/xplg-single/logs/app/*.log
+    Path_Key          path
+    Tag               xplg.app
+    Skip_Long_Lines   On
+    Refresh_Interval  5
+    DB                /var/lib/fluent-bit/xplg-app.pos
+    Mem_Buf_Limit     20MB
+
+# ========== OUTPUTS ==========
+# A) Send system syslog to XPLG Syslog listener (UDP 5514).
+#    NOTE: Comments must be on their own line (no inline comments).
+[OUTPUT]
+    Name              syslog
+    Match             host.syslog
+    Host              10.0.0.85
+    Port              5514
+    Mode              udp
+    Syslog_Format     rfc5424
+    Syslog_Message_Key log
+
+# B) Send Tomcat & app logs via HTTP to the UI endpoint on 30307 with token
+[OUTPUT]
+    Name              http
+    Match             xplg.*
+    Host              10.0.0.85
+    Port              30307
+    URI               /logeye/api/logger.jsp?token=671ca397-65e1-4caa-b340-2b248c014f30
+    Format            json_lines
+    Json_Date_Key     date
+    Json_Date_Format  iso8601
+    Header            Content-Type application/json
+
+```
+
+You’re asking to slow down and:
+
+1. sanity-check the idea of splitting streams so you can land them in different **XPLG folders/logs** (and apply different parsers),
+2. get a **full Fluent Bit config** that does exactly this: **Syslog over TCP → one folder** and **each app log type → its own HTTP token/log/folder**.
+
+Short answer: yes, it **makes sense**—you have genuinely different sources: Tomcat (ServletContainer logs), XPLG app logs, and a local “drop-in” area. I would **not** treat `/home/data` as a “log type” (it’s the XPLG home/data root, not a log path). Use `/incoming` instead for a 3rd, distinct local source. Your compose exposes the needed listeners and mounts (HTTP 30307→30303, Syslog TCP 1468, Syslog UDP 5514, and mounts for Tomcat/app/incoming).&#x20;
+
+Below is a clean, deduped Fluent Bit config that routes:
+
+* **Host syslog** → **Syslog TCP 1468** → XPLG folder e.g., `Zigi-Incoming-Local-syslogs`
+* **Tomcat** → **HTTP token #1** → XPLG folder e.g., `Zigi-Incoming-HTTP-Listener/app-log-type1`
+* **XPLG app** → **HTTP token #2** → XPLG folder e.g., `Zigi-Incoming-HTTP-Listener/app-log-type2`
+* **Local drop-in (/incoming)** → **HTTP token #3** → XPLG folder e.g., `Zigi-Incoming-HTTP-Listener/app-log-type3`
+
+(If you truly want `/home/data` as a source, say so—but it’s unusual. `/incoming` is purpose-built for local files. )
+
+---
+
+# Fluent Bit config (copy-paste)
+
+## `/etc/fluent-bit/fluent-bit.conf`
+
+```ini
+[SERVICE]
+    Flush                    1
+    Daemon                   Off
+    Log_Level                info
+    Parsers_File             /etc/fluent-bit/parsers_multiline.conf
+    HTTP_Server              On
+    HTTP_Listen              0.0.0.0
+    HTTP_Port                2020
+    storage.path             /var/lib/fluent-bit/storage
+    storage.sync             normal
+    storage.backlog.mem_limit 64M
+
+# ========== INPUTS ==========
+
+# 1) Host system syslog
+[INPUT]
+    Name              tail
+    Path              /var/log/syslog
+    Tag               host.syslog
+    DB                /var/lib/fluent-bit/db/host-syslog.db
+    DB.Sync           Normal
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+    Refresh_Interval  5
+    Path_Key          file
+
+# 2) Tomcat catalina logs (multiline)
+[INPUT]
+    Name              tail
+    Path              /home/xplg/xplg-single/logs/tomcat/catalina.*.log
+    Tag               xplg.tomcat.catalina
+    DB                /var/lib/fluent-bit/db/tomcat-catalina.db
+    DB.Sync           Normal
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+    Refresh_Interval  5
+    Path_Key          file
+    multiline.parser  tomcat_multiline
+
+# 2b) Tomcat access logs (single-line)
+[INPUT]
+    Name              tail
+    Path              /home/xplg/xplg-single/logs/tomcat/localhost_access_log.*.txt
+    Tag               xplg.tomcat.access
+    DB                /var/lib/fluent-bit/db/tomcat-access.db
+    DB.Sync           Normal
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+    Refresh_Interval  5
+    Path_Key          file
+
+# 3) XPLG application logs
+[INPUT]
+    Name              tail
+    Path              /home/xplg/xplg-single/logs/app/*.log
+    Tag               xplg.app
+    DB                /var/lib/fluent-bit/db/xplg-app.db
+    DB.Sync           Normal
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+    Refresh_Interval  5
+    Path_Key          file
+    # enable if stacktraces appear here too
+    multiline.parser  tomcat_multiline
+
+# 4) Local drop-in folder (/incoming) for ad-hoc files
+[INPUT]
+    Name              tail
+    Path              /home/xplg/xplg-single/incoming/*.log
+    Tag               local.incoming
+    DB                /var/lib/fluent-bit/db/local-incoming.db
+    DB.Sync           Normal
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+    Refresh_Interval  5
+    Path_Key          file
+
+# ========== OUTPUTS ==========
+
+# A) Host syslog -> XPLG Syslog TCP (compose maps 1468:1468/tcp)
+[OUTPUT]
+    Name               syslog
+    Match              host.syslog
+    Host               10.0.0.85
+    Port               1468
+    Mode               tcp
+    Syslog_Format      rfc5424
+    Syslog_Facility    user
+    Syslog_Severity    info
+    Syslog_Appname     fluentbit
+    Syslog_Message_Key log
+
+# B1) Tomcat (catalina + access) -> HTTP token #1 (UI HTTP via 30307->30303)
+[OUTPUT]
+    Name               http
+    Match              xplg.tomcat.*
+    Host               10.0.0.85
+    Port               30307
+    URI                /logeye/api/logger.jsp?token=REPLACE_WITH_TOKEN_TOMCAT
+    Format             json_lines
+    Json_Date_Key      @timestamp
+    Json_Date_Format   iso8601
+    Header             Content-Type application/json
+    Retry_Limit        False
+
+# B2) XPLG app logs -> HTTP token #2
+[OUTPUT]
+    Name               http
+    Match              xplg.app
+    Host               10.0.0.85
+    Port               30307
+    URI                /logeye/api/logger.jsp?token=REPLACE_WITH_TOKEN_APP
+    Format             json_lines
+    Json_Date_Key      @timestamp
+    Json_Date_Format   iso8601
+    Header             Content-Type application/json
+    Retry_Limit        False
+
+# B3) Local drop-in (/incoming) -> HTTP token #3
+[OUTPUT]
+    Name               http
+    Match              local.incoming
+    Host               10.0.0.85
+    Port               30307
+    URI                /logeye/api/logger.jsp?token=REPLACE_WITH_TOKEN_LOCAL
+    Format             json_lines
+    Json_Date_Key      @timestamp
+    Json_Date_Format   iso8601
+    Header             Content-Type application/json
+    Retry_Limit        False
+```
+
+## `/etc/fluent-bit/parsers_multiline.conf`
+
+```ini
+[MULTILINE_PARSER]
+    Name          tomcat_multiline
+    Type          regex
+    Flush_Timeout 2000
+    Rule          "start_state" "/^\\d{2}-[A-Za-z]{3}-\\d{4} \\d{2}:\\d{2}:\\d{2}\\.\\d{3} .*/" "cont"
+    Rule          "cont" "/^(?!\\d{2}-[A-Za-z]{3}-\\d{4} \\d{2}:\\d{2}:\\d{2}\\.\\d{3} ).+/" "cont"
+```
+
+> Why this lines up with your Docker setup:
+>
+> * **Syslog TCP** is exposed on **1468/tcp** (send host syslog there).
+> * **HTTP token endpoint** is reachable via **30307→30303**; each HTTP output uses a **different token**, so in XPLG you can route to **different folders/logs** and attach **different parsers**.
+> * The mounted log paths (Tomcat, XPLG app, `/incoming`) are exactly the host paths you’re tailing.&#x20;
+
+---
+
+## XPLG side (minimal steps you’ll do once)
+
+1. Create folders/logs + tokens:
+
+   * **`Zigi-Incoming-Local-syslogs`** → **Log** (e.g., `syslog-tcp`) with **parser: Syslog RFC5424**. (This receives the 1468/tcp stream.)
+   * **`Zigi-Incoming-HTTP-Listener/app-log-type1`** → **Log** for **Tomcat** with **Tomcat parser** (or general Java + access log parser as needed). Generate **Token #1**, use it in `REPLACE_WITH_TOKEN_TOMCAT`.
+   * **`Zigi-Incoming-HTTP-Listener/app-log-type2`** → **Log** for **XPLG app** (parser: text/JSON as appropriate). Generate **Token #2**.
+   * **`Zigi-Incoming-HTTP-Listener/app-log-type3`** → **Log** for **/incoming** (parser matched to those files). Generate **Token #3**.
+2. In **Search**, pick each folder/log and confirm events land with the right parser.
+
+---
+
+## Apply & verify (host)
+
+```bash
+# Create state dirs
+sudo mkdir -p /etc/fluent-bit /var/lib/fluent-bit/db /var/lib/fluent-bit/storage
+
+# Put the two files above in place, then:
+sudo systemctl restart fluent-bit
+journalctl -u fluent-bit -n 100 --no-pager
+
+# Quick tests
+logger "FB TEST TCP SYSLOG $(date -Is)"  # should land under Zigi-Incoming-Local-syslogs
+
+# Tomcat test
+ts="$(date '+%d-%b-%Y %H:%M:%S.%3N')"
+td="/home/xplg/xplg-single/logs/tomcat"
+sudo bash -c "echo '$ts INFO [main] Tomcat hello' >> $td/catalina.$(date +%F).log"
+
+# XPLG app test
+sudo bash -c "echo 'FB TEST XPLGAPP $(date -Is)' >> /home/xplg/xplg-single/logs/app/XpoLogConsole.log"
+
+# Local drop-in test
+sudo bash -c "echo 'FB TEST LOCAL $(date -Is)' >> /home/xplg/xplg-single/incoming/test.log"
+```
+
+---
+
+## Tiny visual (keep handy)
+
+```
+Host                   Fluent Bit (tags)                     XPLG (folders/logs)
+──────────────────     ─────────────────────────────────     ──────────────────────────────────────────
+/var/log/syslog  ──›   host.syslog         ──Syslog TCP──›   Zigi-Incoming-Local-syslogs / syslog-tcp
+Tomcat catalina  ──›   xplg.tomcat.catalina ─HTTP+Token#1›   Zigi-Incoming-HTTP-Listener/app-log-type1
+Tomcat access    ──›   xplg.tomcat.access   ─HTTP+Token#1›   (same as above; or split further if you want)
+/opt/xplg-service/log ─› xplg.app           ─HTTP+Token#2›   Zigi-Incoming-HTTP-Listener/app-log-type2
+/incoming/*.log  ──›   local.incoming       ─HTTP+Token#3›   Zigi-Incoming-HTTP-Listener/app-log-type3
+```
+
+If you later decide to split **Tomcat catalina vs access** into **two different logs/parsers**, just give **access** its own token and duplicate the HTTP output with `Match xplg.tomcat.access`.
+
+> Ports & mounts referenced above come from your compose: HTTP **30307→30303**, Syslog **1468/tcp** and **5514/udp**, and mounts for Tomcat, app, and `/incoming`.&#x20;
+
+
+
+You’re asking to confirm: can we use **one HTTP listener/token** and still separate “log types” (e.g., by the source folder/path), and what’s the difference vs the **multi-token** approach you’ve been using. Then you want a **full Fluent Bit config** for the single-token option (only if it’s sensible), so you can apply different parsers/folders per type.
+
+Short answer: **Yes**, you can do single-token and still distinguish types by fields like the **source file path** (we already set `Path_Key file`) or by adding a custom field like `log_type`. Then on the XPLG side you route/parse based on that field (or keep a single log with per-query filters). Your compose exposes the necessary ports & mounts either way: **HTTP 30307→30303**, **Syslog TCP 1468**, **Syslog UDP 5514**, and the bind-mounts for Tomcat/app/incoming.&#x20;
+
+---
+
+# Two implementation patterns (pick one)
+
+| Aspect                  | **Multi-token (one HTTP token per type)**                                  | **Single-token (one HTTP token for all types)**                                                                                        |
+| ----------------------- | -------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Separation of concerns  | Hard separation at ingest (each token → distinct Folder/Log)               | Logical separation via fields (e.g., `log_type`, `file`)                                                                               |
+| XPLG setup              | Create multiple Logs/Folders; assign parser per log; issue 1 token per log | Create 1 Log (one token); either: (a) route by rules/field conditions into sub-logs/folders, or (b) keep one log and use saved filters |
+| Security / blast radius | If one token is misused, only that log is affected                         | One token covers all; stricter care with who can send to it                                                                            |
+| Operational overhead    | More tokens to manage; crystal-clear routing                               | Fewer tokens; you need consistent fielding and rules                                                                                   |
+| Parser granularity      | Trivial: attach parser per log                                             | Requires rules to pick parser per type (or keep one general parser)                                                                    |
+| Future scaling          | Add new type ⇒ new token/log                                               | Add new type ⇒ add a field/rule                                                                                                        |
+
+If you want **strict isolation** per type and the simplest “attach parser here” story, **multi-token** is best. If you prefer **minimal tokens** and are happy to drive separation via fields & rules, **single-token** is fine.
+
+---
+
+# Full Fluent Bit config for the **single-token** approach
+
+This routes:
+
+* **Host syslog** → **Syslog TCP 1468** (unchanged, lands in `Zigi-Incoming-Local-syslogs`).
+* **Tomcat catalina & access**, **XPLG app logs**, **/incoming** → **one HTTP output** (one token).
+  We attach a **`log_type`** field per stream and also keep the **`file`** path (via `Path_Key file`). In XPLG you can then route/parse by `log_type` (or by `file` prefix).
+
+> Replace `REPLACE_WITH_TOKEN_ONE_HTTP` with the single token you’ll create in XPLG for your “Zigi-Incoming-HTTP-Listener” entry-point.
+> Ports/paths match your compose (HTTP 30307→30303, 1468/tcp, 5514/udp; Tomcat/app/incoming mounts).&#x20;
+
+## `/etc/fluent-bit/fluent-bit.conf`
+
+```ini
+[SERVICE]
+    Flush                    1
+    Daemon                   Off
+    Log_Level                info
+    Parsers_File             /etc/fluent-bit/parsers_multiline.conf
+    HTTP_Server              On
+    HTTP_Listen              0.0.0.0
+    HTTP_Port                2020
+    storage.path             /var/lib/fluent-bit/storage
+    storage.sync             normal
+    storage.backlog.mem_limit 64M
+
+# ================== INPUTS ==================
+
+# 1) Host system syslog  -> will go to Syslog TCP
+[INPUT]
+    Name              tail
+    Path              /var/log/syslog
+    Tag               host.syslog
+    DB                /var/lib/fluent-bit/db/host-syslog.db
+    DB.Sync           Normal
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+    Refresh_Interval  5
+    Path_Key          file
+
+# 2) Tomcat catalina (multiline)
+[INPUT]
+    Name              tail
+    Path              /home/xplg/xplg-single/logs/tomcat/catalina.*.log
+    Tag               xplg.tomcat.catalina
+    DB                /var/lib/fluent-bit/db/tomcat-catalina.db
+    DB.Sync           Normal
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+    Refresh_Interval  5
+    Path_Key          file
+    multiline.parser  tomcat_multiline
+
+# 2b) Tomcat access (single-line)
+[INPUT]
+    Name              tail
+    Path              /home/xplg/xplg-single/logs/tomcat/localhost_access_log.*.txt
+    Tag               xplg.tomcat.access
+    DB                /var/lib/fluent-bit/db/tomcat-access.db
+    DB.Sync           Normal
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+    Refresh_Interval  5
+    Path_Key          file
+
+# 3) XPLG application logs
+[INPUT]
+    Name              tail
+    Path              /home/xplg/xplg-single/logs/app/*.log
+    Tag               xplg.app
+    DB                /var/lib/fluent-bit/db/xplg-app.db
+    DB.Sync           Normal
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+    Refresh_Interval  5
+    Path_Key          file
+    multiline.parser  tomcat_multiline
+
+# 4) Local drop-in folder (/incoming)
+[INPUT]
+    Name              tail
+    Path              /home/xplg/xplg-single/incoming/*.log
+    Tag               local.incoming
+    DB                /var/lib/fluent-bit/db/local-incoming.db
+    DB.Sync           Normal
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+    Refresh_Interval  5
+    Path_Key          file
+
+# ================== FILTERS ==================
+# Attach a stable 'log_type' field to each stream for downstream routing/parsers.
+
+[FILTER]
+    Name          modify
+    Match         xplg.tomcat.catalina
+    Add           log_type tomcat_catalina
+
+[FILTER]
+    Name          modify
+    Match         xplg.tomcat.access
+    Add           log_type tomcat_access
+
+[FILTER]
+    Name          modify
+    Match         xplg.app
+    Add           log_type xplg_app
+
+[FILTER]
+    Name          modify
+    Match         local.incoming
+    Add           log_type incoming
+
+# (Optional) add 'source_host' or other metadata
+# [FILTER]
+#     Name          modify
+#     Match         *
+#     Add           source_host storm
+
+# ================== OUTPUTS ==================
+
+# A) Host syslog -> XPLG Syslog TCP (compose 1468:1468/tcp)
+[OUTPUT]
+    Name               syslog
+    Match              host.syslog
+    Host               10.0.0.85
+    Port               1468
+    Mode               tcp
+    Syslog_Format      rfc5424
+    Syslog_Facility    user
+    Syslog_Severity    info
+    Syslog_Appname     fluentbit
+    Syslog_Message_Key log
+
+# B) All app-like logs (tomcat/app/incoming) -> ONE HTTP listener/token
+[OUTPUT]
+    Name               http
+    Match              xplg.tomcat.* 
+    Host               10.0.0.85
+    Port               30307
+    URI                /logeye/api/logger.jsp?token=REPLACE_WITH_TOKEN_ONE_HTTP
+    Format             json_lines
+    Json_Date_Key      @timestamp
+    Json_Date_Format   iso8601
+    Header             Content-Type application/json
+    Retry_Limit        False
+
+[OUTPUT]
+    Name               http
+    Match              xplg.app
+    Host               10.0.0.85
+    Port               30307
+    URI                /logeye/api/logger.jsp?token=REPLACE_WITH_TOKEN_ONE_HTTP
+    Format             json_lines
+    Json_Date_Key      @timestamp
+    Json_Date_Format   iso8601
+    Header             Content-Type application/json
+    Retry_Limit        False
+
+[OUTPUT]
+    Name               http
+    Match              local.incoming
+    Host               10.0.0.85
+    Port               30307
+    URI                /logeye/api/logger.jsp?token=REPLACE_WITH_TOKEN_ONE_HTTP
+    Format             json_lines
+    Json_Date_Key      @timestamp
+    Json_Date_Format   iso8601
+    Header             Content-Type application/json
+    Retry_Limit        False
+```
+
+## `/etc/fluent-bit/parsers_multiline.conf`
+
+```ini
+[MULTILINE_PARSER]
+    Name          tomcat_multiline
+    Type          regex
+    Flush_Timeout 2000
+    Rule          "start_state" "/^\\d{2}-[A-Za-z]{3}-\\d{4} \\d{2}:\\d{2}:\\d{2}\\.\\d{3} .*/" "cont"
+    Rule          "cont" "/^(?!\\d{2}-[A-Za-z]{3}-\\d{4} \\d{2}:\\d{2}:\\d{2}\\.\\d{3} ).+/" "cont"
+```
+
+---
+
+## How to use it in XPLG (single-token flow)
+
+1. Create **one** HTTP log sink (e.g., Folder `Zigi-Incoming-HTTP-Listener`, Log `all-app-http`) and generate **one token** (paste into the config above).
+2. Ingest starts; each record now has:
+
+   * `log` (original line), `file` (full path), `log_type` (e.g., `tomcat_catalina`, `tomcat_access`, `xplg_app`, `incoming`), `@timestamp`.
+3. Choose one of these patterns:
+
+   * **A. Rule-based routing**: create child logs/folders that receive only `log_type == 'tomcat_catalina'`, etc., and attach the specific parser to each.
+   * **B. Single log + saved views**: keep everything in one log, assign a generic JSON parser, and use saved filters (e.g., `log_type:"tomcat_access"`) for dashboards/alerts.
+
+If you want the simplest admin experience and strict per-type isolation, go **multi-token**. If you want fewer tokens and are comfortable with rules/filters, go **single-token**.
+
+---
+
+### Sanity commands (unchanged)
+
+```bash
+# Reload FB
+sudo systemctl restart fluent-bit
+journalctl -u fluent-bit -n 100 --no-pager
+
+# Tests
+logger "FB TEST TCP SYSLOG $(date -Is)"   # should hit syslog TCP (1468)
+
+ts="$(date '+%d-%b-%Y %H:%M:%S.%3N')"
+td="/home/xplg/xplg-single/logs/tomcat"
+sudo bash -c "echo '$ts INFO [main] Tomcat hello' >> $td/catalina.$(date +%F).log"
+sudo bash -c "echo 'FB TEST XPLGAPP $(date -Is)' >> /home/xplg/xplg-single/logs/app/XpoLogConsole.log"
+sudo bash -c "echo 'FB TEST LOCAL $(date -Is)' >> /home/xplg/xplg-single/incoming/test.log"
+```
+
+If you decide to revert to **multi-token (per type)** later, you already have that config from earlier—just swap the HTTP outputs to separate tokens. Ports/mounts remain the same per your compose.&#x20;
+
+
+---
+
+You want to: **(a)** start with the **multi-token** approach, **(b)** get **Syslog-TCP** flowing into XPLG and practice parsing there, then **(c)** get **Tomcat** logs (catalina + access) flowing to separate XPLG targets for parser practice—step-by-step with exact config, commands, and quick checks. This plan makes sense and cleanly matches your compose ports and bind-mounts (HTTP 30307→30303, Syslog TCP 1468, Tomcat/app/incoming mounts).&#x20;
+
+---
+
+# Step 1 — Syslog-TCP → XPLG (practice parsing)
+
+### 1) XPLG UI (once)
+
+* Create folder: **Zigi-Incoming-Local-syslogs**.
+* Inside it create log: **syslog-tcp**, **Parser: Syslog RFC5424**.
+
+(You don’t need a token for Syslog; just the listener. Your compose exposes **1468/tcp** to the container’s 1468.)&#x20;
+
+### 2) Fluent Bit minimal config for Syslog-TCP
+
+`/etc/fluent-bit/fluent-bit.conf` (keep it minimal for this step)
+
+```ini
+[SERVICE]
+    Flush        1
+    Daemon       Off
+    Log_Level    info
+
+# Host syslog
+[INPUT]
+    Name              tail
+    Path              /var/log/syslog
+    Tag               host.syslog
+    DB                /var/lib/fluent-bit/host-syslog.pos
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+    Refresh_Interval  5
+
+# Send ONLY host.syslog to XPLG via TCP 1468
+[OUTPUT]
+    Name               syslog
+    Match              host.syslog
+    Host               10.0.0.85
+    Port               1468
+    Mode               tcp
+    Syslog_Format      rfc5424
+    Syslog_Facility    user
+    Syslog_Severity    info
+    Syslog_Appname     fluentbit
+    Syslog_Message_Key log
+```
+
+### 3) Apply + test
+
+```bash
+sudo systemctl restart fluent-bit
+journalctl -u fluent-bit -n 100 --no-pager
+
+# generate a test syslog line
+logger "FB TEST TCP SYSLOG $(date -Is)"
+
+# (optional) confirm traffic to 1468/tcp
+sudo tcpdump -nn -i any tcp port 1468 -c 5
+```
+
+### 4) Verify in XPLG
+
+* **Search** → select **Zigi-Incoming-Local-syslogs / syslog-tcp** → **Last 5 minutes** → Run.
+* You should see the `FB TEST TCP SYSLOG ...` entry. If not, check container port mapping (**1468:1468/tcp**) and the log’s **Syslog RFC5424** parser.&#x20;
+
+---
+
+# Step 2 — Tomcat logs (catalina + access) via **two HTTP tokens** (separate targets)
+
+> Your compose exposes the UI HTTP **30307→30303**, which serves the token endpoint
+> `/logeye/api/logger.jsp?token=...` — so Fluent Bit should POST to **10.0.0.85:30307**.&#x20;
+
+### 1) XPLG UI (once)
+
+Create:
+
+* Folder: **Zigi-Incoming-HTTP-Listener**
+
+  * Log **tomcat-catalina** → attach **Tomcat** (or Java stacktrace-aware) parser.
+  * Log **tomcat-access** → attach **Access/Apache CLF** (or Tomcat access) parser.
+  * For each log, generate a **separate token** and note them:
+
+    * `TOKEN_TOMCAT_CATALINA`
+    * `TOKEN_TOMCAT_ACCESS`
+
+### 2) Fluent Bit additions for Tomcat
+
+Create multiline parser (if you don’t already have it):
+
+`/etc/fluent-bit/parsers_multiline.conf`
+
+```ini
+[MULTILINE_PARSER]
+    Name          tomcat_multiline
+    Type          regex
+    Flush_Timeout 2000
+    Rule          "start_state" "/^\\d{2}-[A-Za-z]{3}-\\d{4} \\d{2}:\\d{2}:\\d{2}\\.\\d{3} .*/" "cont"
+    Rule          "cont" "/^(?!\\d{2}-[A-Za-z]{3}-\\d{4} \\d{2}:\\d{2}:\\d{2}\\.\\d{3} ).+/" "cont"
+```
+
+Append these to `/etc/fluent-bit/fluent-bit.conf`:
+
+```ini
+# Tell Fluent Bit where to find the multiline parser (add once in [SERVICE] at top)
+# Parsers_File /etc/fluent-bit/parsers_multiline.conf
+
+# --- Tomcat catalina (bind-mounted from host -> container path in compose) ---
+[INPUT]
+    Name              tail
+    Path              /home/xplg/xplg-single/logs/tomcat/catalina.*.log
+    Tag               xplg.tomcat.catalina
+    DB                /var/lib/fluent-bit/tomcat-catalina.pos
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+    Refresh_Interval  5
+    Path_Key          file
+    multiline.parser  tomcat_multiline
+
+# --- Tomcat access (single-line) ---
+[INPUT]
+    Name              tail
+    Path              /home/xplg/xplg-single/logs/tomcat/localhost_access_log.*.txt
+    Tag               xplg.tomcat.access
+    DB                /var/lib/fluent-bit/tomcat-access.pos
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+    Refresh_Interval  5
+    Path_Key          file
+
+# --- HTTP outputs (deduped: each Tomcat stream -> its OWN token) ---
+[OUTPUT]
+    Name               http
+    Match              xplg.tomcat.catalina
+    Host               10.0.0.85
+    Port               30307
+    URI                /logeye/api/logger.jsp?token=TOKEN_TOMCAT_CATALINA
+    Format             json_lines
+    Json_Date_Key      @timestamp
+    Json_Date_Format   iso8601
+    Header             Content-Type application/json
+    Retry_Limit        False
+
+[OUTPUT]
+    Name               http
+    Match              xplg.tomcat.access
+    Host               10.0.0.85
+    Port               30307
+    URI                /logeye/api/logger.jsp?token=TOKEN_TOMCAT_ACCESS
+    Format             json_lines
+    Json_Date_Key      @timestamp
+    Json_Date_Format   iso8601
+    Header             Content-Type application/json
+    Retry_Limit        False
+```
+
+> Those host paths exist because your compose bind-mounts Tomcat logs into the container at `/opt/xplg-service/ServletContainer/logs`, with the host side being `/home/xplg/xplg-single/logs/tomcat`—which is exactly what we’re tailing.&#x20;
+
+### 3) Apply + test
+
+```bash
+sudo systemctl restart fluent-bit
+journalctl -u fluent-bit -n 100 --no-pager
+
+# Tomcat catalina test (one line + a fake stack trace to exercise multiline)
+ts="$(date '+%d-%b-%Y %H:%M:%S.%3N')"
+td="/home/xplg/xplg-single/logs/tomcat"
+sudo bash -c "echo '$ts INFO [main] Tomcat hello' >> $td/catalina.$(date +%F).log"
+sudo bash -c "printf '%s ERROR [main] Simulated exception\njava.lang.RuntimeException: boom\n\tat ex.App.main(App.java:1)\n' \"$ts\" >> $td/catalina.$(date +%F).log"
+
+# Tomcat access test
+sudo bash -c "echo '127.0.0.1 - - [$(date +\"%d/%b/%Y:%H:%M:%S %z\")] \"GET /health HTTP/1.1\" 200 2' >> $td/localhost_access_log.$(date +%Y-%m-%d).txt"
+```
+
+### 4) Verify in XPLG
+
+* **Search → Zigi-Incoming-HTTP-Listener / tomcat-catalina**
+
+  * Expect `Tomcat hello` and a **single** event for the stack trace (multiline stitched).
+* **Search → Zigi-Incoming-HTTP-Listener / tomcat-access**
+
+  * Expect the `/health` GET entry parsed by the access/CLF parser.
+
+---
+
+# (Optional) Step 3 — XPLG App logs via a 3rd token
+
+Your compose bind-mounts app logs (`/home/xplg/xplg-single/logs/app` ↔ container `/opt/xplg-service/log`).&#x20;
+
+**XPLG UI**
+
+* In **Zigi-Incoming-HTTP-Listener**, create log **xplg-app** with the right parser (often text/Java).
+* Generate token `TOKEN_XPLG_APP`.
+
+**Fluent Bit additions**
+
+```ini
+[INPUT]
+    Name              tail
+    Path              /home/xplg/xplg-single/logs/app/*.log
+    Tag               xplg.app
+    DB                /var/lib/fluent-bit/xplg-app.pos
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+    Refresh_Interval  5
+    Path_Key          file
+    multiline.parser  tomcat_multiline
+
+[OUTPUT]
+    Name               http
+    Match              xplg.app
+    Host               10.0.0.85
+    Port               30307
+    URI                /logeye/api/logger.jsp?token=TOKEN_XPLG_APP
+    Format             json_lines
+    Json_Date_Key      @timestamp
+    Json_Date_Format   iso8601
+    Header             Content-Type application/json
+    Retry_Limit        False
+```
+
+**Test**
+
+```bash
+sudo bash -c "echo 'FB TEST XPLGAPP $(date -Is)' >> /home/xplg/xplg-single/logs/app/XpoLogConsole.log"
+```
+
+---
+
+## Quick visual (multi-token)
+
+```
+Host                         Fluent Bit (tags)                     XPLG (folders/logs)
+───────────────────         ─────────────────────────────────     ─────────────────────────────────────────────
+/var/log/syslog     ───›     host.syslog          ─Syslog TCP──›   Zigi-Incoming-Local-syslogs / syslog-tcp
+.../logs/tomcat/    ───›     xplg.tomcat.catalina ─HTTP + T1──›    Zigi-Incoming-HTTP-Listener / tomcat-catalina
+.../logs/tomcat/    ───›     xplg.tomcat.access   ─HTTP + T2──›    Zigi-Incoming-HTTP-Listener / tomcat-access
+.../logs/app/*.log  ───›     xplg.app             ─HTTP + T3──›    Zigi-Incoming-HTTP-Listener / xplg-app
+```
+
+---
+
+## If anything doesn’t show up
+
+* Confirm port binds:
+  `docker ps --format '{{.Names}} -> {{.Ports}}' | grep xplg-single` (look for **1468/tcp**, **30307->30303**, **5514/udp**).&#x20;
+* Fluent Bit logs: `journalctl -u fluent-bit -n 200 --no-pager`
+* HTTP endpoint test (token + port):
+
+  ```bash
+  curl -v -X POST -H 'Content-Type: application/json' \
+    --data-binary '{"message":"manual http check","ts":"'"$(date -Is)"'"}' \
+    'http://10.0.0.85:30307/logeye/api/logger.jsp?token=TOKEN_TOMCAT_CATALINA'
+  ```
+
+When you’re ready, start with **Step 1** (Syslog-TCP) exactly as shown, confirm you can parse in XPLG, then add **Step 2** for Tomcat.
+---
+
+
+You’re saying: **“Do not parse in Fluent Bit; I want all parsing done in XPLG’s UI parser engine.”**
+Got it—makes total sense. We’ll run Fluent Bit as a **dumb shipper** only (no multiline stitching, no filtering, no transforms). We’ll just tail files and forward them as-is to your XPLG listeners that you exposed in compose (**HTTP via 30307→30303, Syslog TCP on 1468, Syslog UDP on 5514**).&#x20;
+
+Here’s how we proceed (multi-token path you chose):
+
+# Step 1 — Syslog-TCP → XPLG (no parsing in FB)
+
+1. **XPLG UI (once)**
+   Folder: `Zigi-Incoming-Local-syslogs` → Log: `syslog-tcp` → **Parser: Syslog RFC5424**.
+
+2. **Fluent Bit (ship only)**
+   `/etc/fluent-bit/fluent-bit.conf`
+
+```ini
+[SERVICE]
+    Flush        1
+    Daemon       Off
+    Log_Level    info
+
+# Tail host syslog (ship only)
+[INPUT]
+    Name              tail
+    Path              /var/log/syslog
+    Tag               host.syslog
+    DB                /var/lib/fluent-bit/host-syslog.pos
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+
+# Send to XPLG Syslog TCP listener (compose maps host 1468 -> container 1468)
+[OUTPUT]
+    Name               syslog
+    Match              host.syslog
+    Host               10.0.0.85
+    Port               1468
+    Mode               tcp
+    Syslog_Format      rfc5424
+    Syslog_Facility    user
+    Syslog_Severity    info
+    Syslog_Appname     fluentbit
+    Syslog_Message_Key log
+```
+
+3. **Test & verify**
+
+```bash
+sudo systemctl restart fluent-bit
+logger "FB TEST TCP SYSLOG $(date -Is)"
+# In XPLG Search: Zigi-Incoming-Local-syslogs / syslog-tcp (Last 5m)
+```
+
+# Step 2 — Tomcat → XPLG via **two HTTP tokens** (no parsing in FB)
+
+We’ll send **one JSON object per line** with the original line in the `log` field. XPLG will do the parsing (choose the proper parser in each target log).
+
+1. **XPLG UI (once)**
+   Folder: `Zigi-Incoming-HTTP-Listener`
+
+* Log: `tomcat-catalina` → **Parser: Tomcat/Java** (in XPLG). → **Token A**
+* Log: `tomcat-access`   → **Parser: Access/CLF** (in XPLG). → **Token B**
+
+2. **Fluent Bit additions (ship only; no multiline)**
+   *Notice: **no** `multiline.parser` and **no** filters—pure forwarding.*
+
+```ini
+# --- Tomcat catalina (ship only)
+[INPUT]
+    Name              tail
+    Path              /home/xplg/xplg-single/logs/tomcat/catalina.*.log
+    Tag               xplg.tomcat.catalina
+    DB                /var/lib/fluent-bit/tomcat-catalina.pos
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+    Path_Key          file
+
+# --- Tomcat access (ship only)
+[INPUT]
+    Name              tail
+    Path              /home/xplg/xplg-single/logs/tomcat/localhost_access_log.*.txt
+    Tag               xplg.tomcat.access
+    DB                /var/lib/fluent-bit/tomcat-access.pos
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+    Path_Key          file
+
+# --- HTTP outputs per type (tokens map to different XPLG logs)
+[OUTPUT]
+    Name               http
+    Match              xplg.tomcat.catalina
+    Host               10.0.0.85
+    Port               30307
+    URI                /logeye/api/logger.jsp?token=TOKEN_A
+    Format             json_lines        # one JSON obj per line
+    Json_Date_Key      @timestamp
+    Json_Date_Format   iso8601
+    Header             Content-Type application/json
+    Retry_Limit        False
+
+[OUTPUT]
+    Name               http
+    Match              xplg.tomcat.access
+    Host               10.0.0.85
+    Port               30307
+    URI                /logeye/api/logger.jsp?token=TOKEN_B
+    Format             json_lines
+    Json_Date_Key      @timestamp
+    Json_Date_Format   iso8601
+    Header             Content-Type application/json
+    Retry_Limit        False
+```
+
+Why 30307? Your compose maps **host 30307 → container 30303**, which serves the token endpoint.&#x20;
+
+3. **Test & verify (no parsing at FB)**
+
+```bash
+sudo systemctl restart fluent-bit
+
+# Write a catalina line and an access line
+ts="$(date '+%d-%b-%Y %H:%M:%S.%3N')"
+td="/home/xplg/xplg-single/logs/tomcat"
+sudo bash -c "echo '$ts INFO [main] Tomcat hello' >> $td/catalina.$(date +%F).log"
+sudo bash -c "echo '127.0.0.1 - - [$(date +\"%d/%b/%Y:%H:%M:%S %z\")] \"GET /health HTTP/1.1\" 200 2' >> $td/localhost_access_log.$(date +%Y-%m-%d).txt"
+
+# In XPLG Search:
+#  - Folder Zigi-Incoming-HTTP-Listener / Log tomcat-catalina -> confirm parser extracts fields
+#  - Folder Zigi-Incoming-HTTP-Listener / Log tomcat-access   -> confirm CLF fields
+```
+
+## Notes to keep us honest about “no parsing in FB”
+
+* We **did not** enable any `multiline.parser`, nor any `filter`, nor `record_modifier`—so Fluent Bit isn’t changing content, it’s just wrapping each line as JSON for the HTTP transport (with your original text in the `log` field).
+* All parsing (Syslog RFC5424, Tomcat, Access/CLF) is configured **in XPLG** at the target logs.
+* If later you want stacktraces as single events, do that with XPLG’s multiline settings, not in Fluent Bit.
+
+If that all looks good, go ahead and apply **Step 1** now (Syslog-TCP), confirm in Search, then do **Step 2** (Tomcat). If you hit anything odd, we’ll adjust quickly.&#x20;
+
+
+---
+
+
+You’re asking: (1) what that command does, and (2) why it errored + how to fix it so we can ship `/var/log/syslog` over **Syslog-TCP :1468** (parsing in XPLG only). You also want to keep going once it’s green.
+
+---
+
+## 1) What this command does
+
+```bash
+sudo /opt/fluent-bit/bin/fluent-bit -c /etc/fluent-bit/fluent-bit.conf -t
+```
+
+* `-c /etc/fluent-bit/fluent-bit.conf` → load that config file.
+* `-t` in Fluent Bit means **“set tag”** (it requires a value), **not** “test”.
+* For a config/dry-run test, use **`-D` or `--dry-run`** instead:
+
+```bash
+sudo /opt/fluent-bit/bin/fluent-bit -c /etc/fluent-bit/fluent-bit.conf -D
+```
+
+That validates the config and exits without starting the service.
+
+---
+
+## 2) Why it failed & the fix
+
+Your syslog output used old option names. This Fluent Bit expects the `*_preset`/`*_key` variants. Replace your `[OUTPUT]` block with:
+
+```ini
+[OUTPUT]
+    Name                   syslog
+    Match                  host.syslog
+    Host                   10.0.0.85
+    Port                   1468
+    Mode                   tcp
+    syslog_format          rfc5424
+    syslog_facility_preset user
+    syslog_severity_preset info
+    syslog_appname_preset  fluentbit
+    syslog_message_key     log
+```
+
+(Your Docker compose does publish **1468/tcp** for the container, and **30307→30303** for the UI/token endpoint we’ll use later. That wiring is correct. )
+
+---
+
+## 3) Apply → validate → start → test
+
+```bash
+# ensure state dir exists (one-time)
+sudo mkdir -p /var/lib/fluent-bit
+
+# 1) validate (should PASS, exits)
+sudo /opt/fluent-bit/bin/fluent-bit -c /etc/fluent-bit/fluent-bit.conf -D
+
+# 2) reset crash backoff and start
+sudo systemctl reset-failed fluent-bit
+sudo systemctl restart fluent-bit
+journalctl -u fluent-bit -n 120 --no-pager
+
+# 3) quick end-to-end test
+logger "FB TEST TCP SYSLOG $(date -Is)"
+# (optional) see packets leaving to :1468
+sudo tcpdump -nn -i any tcp port 1468 -c 3
+```
+
+In XPLG:
+
+* Folder **Zigi-Incoming-Local-syslogs** → Log **syslog-tcp** with **Syslog RFC5424** parser → Search (Last 5m). You should see the test line.
+
+---
+
+If the dry-run prints anything else, drop the exact error line here and I’ll pinpoint a fix. Once this is green, we’ll move to **Tomcat via two HTTP tokens** (still no parsing in Fluent Bit; all parsing in XPLG).&#x20;
+
+
+
+You’re asking for a quick status check based on your screenshot, plus why we “generate” logs when syslog/app already write to disk.
+
+## Status (good news)
+
+* **Pipeline is working end-to-end for Syslog-TCP.** Your XPLG Log Viewer shows Fluent Bit’s own startup lines arriving over TCP 1468 in the **Syslog TCP-zigi** log. That proves:
+
+  * Fluent Bit is running and tailing.
+  * Network path to the container on **1468/tcp** is OK.
+  * XPLG is ingesting and your RFC5424 parser is decoding.&#x20;
+* Your Docker compose still gives you all required listeners & mounts for the next steps (UI HTTP 30307→30303 for the token endpoint, Syslog UDP 5514, Syslog TCP 1468, Tomcat/app/incoming mounts).&#x20;
+
+## “Why generate logs?”
+
+You don’t have to. We use `logger "…"` (or echo into a test file) only to:
+
+* force an immediate event (so you don’t wait for natural noise),
+* prove the whole path in seconds (source → FB → XPLG),
+* tell apart test lines from organic traffic when validating parsers.
+
+If your system and apps are already chatty, you can skip test generation and just watch them flow.
+
+---
+
+## What I recommend next (fast & focused)
+
+You said today’s goal is: 1) syslog-tcp parsing, then 2) Tomcat parsing. Syslog-TCP is clearly landing in XPLG; do a quick parser sanity check, then we wire Tomcat with **two HTTP tokens** (still no parsing in FB).
+
+### A) Quick parser sanity on Syslog-TCP
+
+* In the **Syslog TCP-zigi** log, confirm fields (timestamp, facility, level, app name).
+  Note: the Fluent Bit banner lines you see are expected on service (re)start; once the host logs change (cron, ssh, etc.), you’ll see those too.
+
+If you want a quick on-demand event without `logger`, just restart a service (e.g., `sudo systemctl restart fluent-bit`)—that alone emits a few syslog entries you’ll see in XPLG.
+
+### B) Wire Tomcat (multi-token; parsing only in XPLG)
+
+1. In XPLG UI create/confirm:
+
+   * Folder **HTTP Listener Zigi-App-logs**
+
+     * Log **tomcat-catalina** (attach Tomcat/Java parser) → **Token A**
+     * Log **tomcat-access** (attach Access/CLF parser) → **Token B**
+
+2. Add these to `/etc/fluent-bit/fluent-bit.conf` (leave your working syslog output as-is):
+
+```ini
+# --- Tomcat catalina ---
+[INPUT]
+    Name              tail
+    Path              /home/xplg/xplg-single/logs/tomcat/catalina.*.log
+    Tag               xplg.tomcat.catalina
+    DB                /var/lib/fluent-bit/tomcat-catalina.pos
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+    Path_Key          file
+
+# --- Tomcat access ---
+[INPUT]
+    Name              tail
+    Path              /home/xplg/xplg-single/logs/tomcat/localhost_access_log.*.txt
+    Tag               xplg.tomcat.access
+    DB                /var/lib/fluent-bit/tomcat-access.pos
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+    Path_Key          file
+
+# --- HTTP outputs (each stream -> its own token/log) ---
+[OUTPUT]
+    Name               http
+    Match              xplg.tomcat.catalina
+    Host               10.0.0.85
+    Port               30307
+    URI                /logeye/api/logger.jsp?token=TOKEN_A
+    Format             json_lines
+    Json_Date_Key      @timestamp
+    Json_Date_Format   iso8601
+    Header             Content-Type application/json
+    Retry_Limit        False
+
+[OUTPUT]
+    Name               http
+    Match              xplg.tomcat.access
+    Host               10.0.0.85
+    Port               30307
+    URI                /logeye/api/logger.jsp?token=TOKEN_B
+    Format             json_lines
+    Json_Date_Key      @timestamp
+    Json_Date_Format   iso8601
+    Header             Content-Type application/json
+    Retry_Limit        False
+```
+
+3. Reload & verify:
+
+```bash
+sudo systemctl restart fluent-bit
+journalctl -u fluent-bit -n 100 --no-pager
+
+# Optional: create one line in each Tomcat log to avoid waiting for traffic
+ts="$(date '+%d-%b-%Y %H:%M:%S.%3N')"
+td="/home/xplg/xplg-single/logs/tomcat"
+sudo bash -c "echo '$ts INFO [main] Tomcat hello' >> $td/catalina.$(date +%F).log"
+sudo bash -c "echo '127.0.0.1 - - [$(date +\"%d/%b/%Y:%H:%M:%S %z\")] \"GET /health HTTP/1.1\" 200 2' >> $td/localhost_access_log.$(date +%Y-%m-%d).txt"
+```
+
+4. In XPLG:
+
+* **HTTP Listener Zigi-App-logs / tomcat-catalina** → confirm your Tomcat parser extracts fields.
+* **… / tomcat-access** → confirm CLF fields.
+  (HTTP token endpoint is on the UI port mapping **30307→30303**, as per your compose.)&#x20;
+
+---
+
+If you want, we can also split **catalina** and **access** into different sub-folders, or add a third stream for **/incoming** later. For now, you’ve proven Syslog-TCP is good—nice work. Ready to proceed with the Tomcat tokens?
+
+
+
+You’re asking for a quick status + how to improve parsing for your **Syslog TCP-zigi** log (specifically: “can the Message column be parsed further?”). Yes—and your screenshot helps.
+
+## Status (quick)
+
+* ✅ End-to-end **Syslog-TCP → XPLG** is working: the Log Viewer shows Fluent Bit startup lines arriving over TCP **1468** and being indexed. Your compose exposes that port (and the UI HTTP 30307→30303 for later HTTP tests).&#x20;
+* The early lines showing “unknown configuration property ‘syslog\_facility’” are from the failed start you fixed; new lines (after the `*_preset` change) should show the correct facility/severity.
+
+## Why the Message looks “raw”
+
+Syslog brings many formats in the **message** body (systemd, cron, Fluent Bit banners, etc.). The base “Syslog RFC5424” parser extracts header fields (timestamp, host, appname, facility, severity), but it **doesn’t** deep-parse every product’s message text. You can add lightweight, log-specific extraction rules **in XPLG** to structure that Message column further—still keeping parsing **inside XPLG**, not in Fluent Bit.
+
+## Improve parsing (add secondary patterns in XPLG)
+
+In the **Syslog TCP-zigi** log → **Edit Data** → keep the primary parser as **Syslog RFC5424**. Then add **Active Log Pattern** entries (ordered). These target common message shapes you’re seeing:
+
+1. **Fluent Bit module lines**
+   *Example:* `fluentbit[2996190]: [info] [input:tail:0] initializing`
+
+   ```
+   ^(?<Application>fluentbit)(?:\[(?<Process Id>\d+)\])?: \[(?<fb_level>[a-z]+)\]\s+\[(?<fb_module>[^\]]+)\]\s+(?<fb_detail>.+)$
+   ```
+
+   Fields added: `fb_level`, `fb_module`, `fb_detail`.
+
+2. **Generic “prog\[pid]: msg” (systemd services, many daemons)**
+   *Example:* `CRON[2995347]: (root) CMD (command …)`
+
+   ```
+   ^(?<Application Name>[^:\[\]]+)(?:\[(?<Process Id>\d+)\])?:\s+(?<Detail>.+)$
+   ```
+
+   Fields: `Application Name`, `Process Id`, `Detail`.
+
+3. **Plain “prog: msg” (no pid)**
+
+   ```
+   ^(?<Application Name>[^:\[\]]+):\s+(?<Detail>.+)$
+   ```
+
+4. **CRON explicit (if you want richer fields later)**
+
+   ```
+   ^CRON\[(?<Process Id>\d+)\]:\s+(?<Detail>.+)$
+   ```
+
+> Tip: put the **Fluent Bit** pattern first, then the **generic** ones. In the “Verify Pattern Parsing Sample” panel you’ll see the new columns populate immediately on sample rows.
+
+## Small sanity checks
+
+* In your Fluent Bit output, you already switched to the new option names; after restart you should see `Facility=user`, `Level=info` on new records (old “EMERGENCY/kern” rows are from the earlier fail cycle).
+* If you want to expose more context to XPLG without parsing at the shipper, you can add a **static tag** in Fluent Bit (e.g., `Tag host.syslog`—you already have it). In XPLG you can display that tag or route based on it if needed—no parsing done in FB.
+
+## Next step (if you’re ready)
+
+* Keep this Syslog TCP-zigi log as your “practice” playground; save the above patterns.
+* Then we’ll add **Tomcat** (two **HTTP tokens**) so you can attach Tomcat-specific parsers on their own logs. Your compose already maps the UI HTTP **30307→30303**, which serves the token endpoint we’ll post to from Fluent Bit.&#x20;
+
+If you paste one or two sample “Message” lines here, I’ll tailor a pattern exactly to them (names you prefer, optional field casts), but the three patterns above should immediately structure most of what your screenshot shows.
+
+
+---
+
+
+You’re asking: “how can I see exactly what Fluent Bit is sending—before I look in the XPLG UI—so I know the payload/fields and can tune parsing?” Totally doable. Here are the cleanest options; pick 1–2 that fit your style. (Ports and mounts below match your compose: HTTP on 30307→30303, Syslog TCP 1468, Syslog UDP 5514. )
+
+---
+
+## Option A — Mirror to stdout or a file (non-invasive, easiest)
+
+Add a **temporary extra output** that prints the records locally while still sending to XPLG. This won’t duplicate in XPLG (it just adds another local sink).
+
+### See what’s leaving for Syslog-TCP (original lines)
+
+```ini
+# TEMP: print host.syslog events to the journal/console
+[OUTPUT]
+    Name   stdout
+    Match  host.syslog
+```
+
+### See what’s leaving for HTTP (Tomcat/app)
+
+```ini
+# TEMP: print Tomcat catalina
+[OUTPUT]
+    Name   stdout
+    Match  xplg.tomcat.catalina
+
+# TEMP: print Tomcat access
+[OUTPUT]
+    Name   stdout
+    Match  xplg.tomcat.access
+```
+
+(If you prefer a file, use the `file` output:)
+
+```ini
+[OUTPUT]
+    Name   file
+    Match  xplg.tomcat.*
+    Path   /tmp
+    File   fb-preview.jsonl
+```
+
+Reload, then watch:
+
+```bash
+sudo systemctl restart fluent-bit
+journalctl -u fluent-bit -f --no-pager    # stdout output will show full records
+# or: tail -f /tmp/fb-preview.jsonl
+```
+
+What you’ll see:
+
+* For **tail** inputs, Fluent Bit records contain keys like `log` (the raw line), `file` (source path), plus timestamps. That’s exactly what goes to the HTTP output (one JSON object per line). For Syslog, the **wire** is RFC5424, but your stdout/file shows the pre-rendered record (handy for checking the `log` content you’ll parse in XPLG).
+
+Remove these temp outputs once you’re satisfied.
+
+---
+
+## Option B — Packet capture on the wire (true “over-the-wire” view)
+
+If you want to see the exact bytes that hit XPLG:
+
+### Syslog-TCP (:1468)
+
+```bash
+sudo tcpdump -i any -nn -s0 -A tcp port 1468
+```
+
+You’ll see RFC5424 frames (header + message).
+
+### HTTP token endpoint (host 30307 → container 30303)
+
+```bash
+sudo tcpdump -i any -nn -s0 -A tcp port 30307
+# or, very readable lines:
+sudo ngrep -d any -W byline port 30307
+```
+
+You’ll see HTTP headers and the **NDJSON** payload (`json_lines`) you post.
+
+(Those ports are published by your container: 30307→30303, 1468/tcp, 5514/udp. )
+
+---
+
+## Option C — One-off manual post to the HTTP listener (sanity)
+
+Great to confirm tokens and payload shape:
+
+```bash
+curl -v -X POST \
+  -H 'Content-Type: application/json' \
+  --data-binary '{"log":"manual sanity line","file":"/tmp/sanity.log","@timestamp":"'"$(date -Is)"'"}' \
+  'http://10.0.0.85:30307/logeye/api/logger.jsp?token=REPLACE_WITH_TOKEN'
+```
+
+You’ll see the HTTP response immediately, and the event will appear in that token’s log.
+
+---
+
+## Option D — Temporary local listener (for experiments)
+
+If you want to **peek** at what Fluent Bit would send, without touching XPLG yet:
+
+```bash
+# Start a throwaway syslog TCP listener on 0.0.0.0:5515
+sudo ncat -lk 0.0.0.0 5515
+
+# Temporarily point a test output at it
+[OUTPUT]
+    Name   syslog
+    Match  host.syslog
+    Host   127.0.0.1
+    Port   5515
+    Mode   tcp
+    syslog_format          rfc5424
+    syslog_facility_preset user
+    syslog_severity_preset info
+    syslog_appname_preset  fluentbit
+    syslog_message_key     log
+```
+
+You’ll see the frames in your terminal. Then remove this test block and keep the real :1468 output.
+
+---
+
+### Which should you use?
+
+* **Fastest insight:** Option A (stdout/file) + a quick **journalctl -f**.
+* **Exact wire view:** Option B (tcpdump/ngrep).
+* **Token sanity:** Option C (curl).
+
+All three keep parsing **entirely in XPLG** (we’re not mutating the log content in Fluent Bit). Once you’ve previewed what’s going out, we can finish wiring the two Tomcat HTTP outputs and verify your XPLG parsers extract what you want.
+
+Want me to add the stdout/file mirror for just the Tomcat streams while we keep Syslog-TCP untouched?
+
+
+
+You’re asking me to (a) look at your Syslog TCP-zigi “Edit Data” screen and (b) tighten the parsing so the **Message** column is further structured—before you add the HTTP-token listeners. Got it. Below is a minimal, safe way to improve the log view without touching Fluent Bit (parsing stays in XPLG).
+
+---
+
+## What you already have (and what to keep)
+
+* **Primary parser:** Syslog RFC5424 — good; keep it as the first (base) pattern.
+* **Traffic path:** host → Fluent Bit → XPLG Syslog TCP on **1468/tcp** (your compose publishes this as well as the UI HTTP 30307→30303).&#x20;
+
+The base parser extracts header fields (timestamp, facility, severity, app name, pid), but leaves **Message** as free text. We’ll layer a few **secondary patterns** to structure common shapes you’re seeing (systemd/daemon lines, CRON, Fluent Bit startup lines, etc.).
+
+---
+
+## Add these secondary patterns (ordered, top → bottom)
+
+In **Edit Data → Active Log Pattern List**:
+
+1. Click **“+”** to add a pattern
+2. Paste the **Regex**, name the fields exactly as below (match your column names), save
+3. Order matters: put the *more specific* patterns first
+
+> Tip: Use the “Verify Pattern Parsing Sample” panel to preview immediately.
+
+### 1) Fluent Bit banner / module lines (specific)
+
+Matches lines like:
+`fluentbit[2996190]: [info] [input:tail:0] initializing`
+
+```
+^(?<Application Name>fluentbit)(?:\[(?<Process Id>\d+)\])?:\s+\[(?<fb_level>[a-z]+)\]\s+\[(?<fb_module>[^\]]+)\]\s+(?<fb_detail>.+)$
+```
+
+Adds: `fb_level`, `fb_module`, `fb_detail`.
+
+### 2) Generic `prog[pid]: message` (systemd-friendly)
+
+Matches most daemon lines, e.g. `CRON[1234]: ...`, `systemd[1]: ...`
+
+```
+^(?<Application Name>[^:\[\]]+)(?:\[(?<Process Id>\d+)\])?:\s+(?<Detail>.+)$
+```
+
+Adds: `Detail` (you can rename to `Message Detail` if you prefer).
+
+### 3) Kernel‐style or banner lines that are just text
+
+If you have raw kernel/system banners without `prog:`:
+
+```
+^(?<Detail>.+)$
+```
+
+(Keep this **last** as a catch-all so it doesn’t steal matches from the specific ones.)
+
+### 4) Optional: split key=value segments inside Detail (when present)
+
+If you often see `key1=val1 key2=val2 ...` in the message, add a **second pass** pattern to *only* run when `Detail` has `key=value`. You can use XPLG’s pattern to capture the whole key/val blob:
+
+```
+^(?:(?<kv>(?:[A-Za-z0-9_.-]+=[^ ]+\s*)+).*)$
+```
+
+Now create a **Field Extraction rule** (Add → Extract Fields from Text) against `kv` with **Key/Value delimiter = `=`** and **Pair delimiter = space** to explode those into columns. (If you prefer, keep this for later; the first two patterns usually deliver 80–90% clarity.)
+
+---
+
+## Field naming and ordering tips
+
+* Reuse XPLG’s header fields: `Timestamp`, `Facility`, `Level`, `Application Name`, `Process Id`, and then your custom fields (`fb_level`, `fb_module`, `Detail`).
+* Put **Fluent Bit** pattern first, then the **generic** daemon pattern, then the **catch-all**.
+* Avoid greedy `.*` ahead of critical brackets; the patterns above already constrain with `[^]` character classes.
+
+---
+
+## Quick sanity checklist in the UI
+
+1. Keep **Syslog RFC5424** as the primary parser.
+2. Add the patterns above in that order.
+3. Use the **Verify Pattern Parsing Sample** area to confirm:
+
+   * FB lines show `fb_level`, `fb_module`, `fb_detail`
+   * CRON/systemd lines show `Application Name`, optional `Process Id`, and `Detail`
+4. Save. In **Search**, you should now see those new columns.
+
+---
+
+## Why this is safe
+
+* No changes in Fluent Bit (still a dumb shipper).
+* XPLG does all parsing.
+* You can refine or disable any pattern without redeploying the agent.
+
+---
+
+## Next step (when you’re happy with this)
+
+We’ll add **two HTTP token** listeners for Tomcat (catalina + access), posting to the same container (HTTP via host **30307 → container 30303**). You’ll attach Tomcat/Access parsers in their respective logs and get the same, clean fielded view.&#x20;
+
+If you paste 1–2 representative “Message” lines you want to break down further, I’ll tailor a pinpoint regex for them (e.g., to pull HTTP method/path/status/bytes from access-like lines in this syslog stream).
+
+
+
+```ini
+[SERVICE]
+    Flush        1
+    Daemon       Off
+    Log_Level    info
+
+# Tail host syslog (ship only)
+[INPUT]
+    Name              tail
+    Path              /var/log/syslog
+    Tag               host.syslog
+    DB                /var/lib/fluent-bit/host-syslog.pos
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+
+# Send to XPLG Syslog TCP listener (compose maps host 1468 -> container 1468)
+[OUTPUT]
+    Name                   syslog
+    Match                  host.syslog
+    Host                   10.0.0.85
+    Port                   1468
+    Mode                   tcp
+    syslog_format          rfc5424
+    syslog_facility_preset user
+    syslog_severity_preset info
+    syslog_appname_preset  fluentbit
+    syslog_message_key     log
+# TEMP: print host.syslog events to the journal/console
+[OUTPUT]
+    Name   stdout
+    Match  host.syslog
+# --- Tomcat catalina ---
+[INPUT]
+    Name              tail
+    Path              /home/xplg/xplg-single/logs/tomcat/catalina.*.log
+    Tag               xplg.tomcat.catalina
+    DB                /var/lib/fluent-bit/tomcat-catalina.pos
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+    Path_Key          file
+# --- HTTP outputs (each stream -> its own token/log) ---
+[OUTPUT]
+    Name               http
+    Match              xplg.tomcat.catalina
+    Host               10.0.0.85
+    Port               30307
+    URI                /logeye/api/logger.jsp?token=TOKEN_A
+    Format             json_lines
+    Json_Date_Key      @timestamp
+    Json_Date_Format   iso8601
+    Header             Content-Type application/json
+    Retry_Limit        False
+
+# --- Tomcat access ---
+[INPUT]
+    Name              tail
+    Path              /home/xplg/xplg-single/logs/tomcat/localhost_access_log.*.txt
+    Tag               xplg.tomcat.access
+    DB                /var/lib/fluent-bit/tomcat-access.pos
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+    Path_Key          file
+
+[OUTPUT]
+    Name               http
+    Match              xplg.tomcat.access
+    Host               10.0.0.85
+    Port               30307
+    URI                /logeye/api/logger.jsp?token=TOKEN_B
+    Format             json_lines
+    Json_Date_Key      @timestamp
+    Json_Date_Format   iso8601
+    Header             Content-Type application/json
+    Retry_Limit        False
+
+
+```
+
+##### fluenbit config #2
+
+
+```ini
+[SERVICE]
+    Flush        1
+    Daemon       Off
+    Log_Level    info
+
+# Tail host syslog (ship only)
+[INPUT]
+    Name              tail
+    Path              /var/log/syslog
+    Tag               host.syslog
+    DB                /var/lib/fluent-bit/host-syslog.pos
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+
+# --- Tomcat access ---
+[INPUT]
+    Name              tail
+    Path              /home/xplg/xplg-single/logs/tomcat/localhost_access_log.*.txt
+    Tag               xplg.tomcat.access
+    DB                /var/lib/fluent-bit/tomcat-access.pos
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+    Path_Key          file
+
+# --- Tomcat catalina ---
+[INPUT]
+    Name              tail
+    Path              /home/xplg/xplg-single/logs/tomcat/catalina.*.log
+    Tag               xplg.tomcat.catalina
+    DB                /var/lib/fluent-bit/tomcat-catalina.pos
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+    Path_Key          file
+
+# Send to XPLG Syslog TCP listener (compose maps host 1468 -> container 1468)
+[OUTPUT]
+    Name                   syslog
+    Match                  host.syslog
+    Host                   10.0.0.85
+    Port                   1468
+    Mode                   tcp
+    syslog_format          rfc5424
+    syslog_facility_preset user
+    syslog_severity_preset info
+    syslog_appname_preset  fluentbit
+    syslog_message_key     log
+
+# --- HTTP outputs (each stream -> its own token/log) ---
+[OUTPUT]
+    Name               http
+    Match              xplg.tomcat.catalina
+    Host               10.0.0.85
+    Port               30307
+    URI                /logeye/api/logger.jsp?token=TOKEN_A
+    Format             json_lines
+    Json_Date_Key      @timestamp
+    Json_Date_Format   iso8601
+    Header             Content-Type application/json
+    Retry_Limit        False
+
+[OUTPUT]
+    Name               http
+    Match              xplg.tomcat.access
+    Host               10.0.0.85
+    Port               30307
+    URI                /logeye/api/logger.jsp?token=TOKEN_B
+    Format             json_lines
+    Json_Date_Key      @timestamp
+    Json_Date_Format   iso8601
+    Header             Content-Type application/json
+    Retry_Limit        False
+
+
+```
+---
+
+You’re asking me to (a) explain why you’re seeing **duplicates** in the Folders & Logs tree and why a **source path folder** appeared “by itself”, and (b) propose a **clean-up + restart** plan before we continue with the HTTP-token listeners. Got it. Here’s the straight answer and a safe reset plan.
+
+## What’s happening (why duplicates showed up)
+
+1. **You created more than one ingest path for the same data type.**
+
+   * At least one **HTTP Listener** was created twice (same/similar name), so you now have two folders/logs that both accept posts.
+   * Fluent Bit may be posting to more than one token (or you briefly posted test data via curl to a different token), so entries land in multiple logs.
+
+2. **A “local file” source was added earlier.**
+
+   * The tree item that looks like a **file path** (e.g., `/home/xplg/xplg-single/logs/app/...`) means you once added a **Local/File** data source. That creates a path-named folder/log under the root, separate from your HTTP/Syslog listeners.
+
+3. **Auto grouping by source device/IP (for HTTP).**
+
+   * Some HTTP listener wizards default to nesting a **subfolder named after the sender** (e.g., `10.0.0.85`). If enabled (or if you picked that folder as “Parent”), the UI will show a `…/10.0.0.85` level even if you didn’t intend it.
+
+All of this is separate from your container ports and mounts, which are correct: UI HTTP is **30307→30303**, Syslog TCP **1468**, Syslog UDP **5514**, and your log bind-mounts are in place.&#x20;
+
+---
+
+## Quick, safe clean-up plan (no data parsing changes)
+
+Do this order to avoid racey posts during cleanup:
+
+1. **Pause the shipper**
+
+```bash
+sudo systemctl stop fluent-bit
+```
+
+2. **Pick the canonical structure (simple & unambiguous)**
+
+* **Syslog:**
+  Folder: `Zigi-Syslog-TCP` → Log: `syslog-tcp` (Parser: Syslog RFC5424).
+* **HTTP (app logs):**
+  Folder: `Zigi-HTTP-App-logs`
+
+  * Log: `tomcat-catalina` (Parser: Tomcat/Java) → **Token A**
+  * Log: `tomcat-access`   (Parser: Access/CLF)   → **Token B**
+
+> Tip: don’t reuse folder names as log names; keep names unique and short.
+
+3. **Delete or move the strays**
+
+* In **Folders & Logs**: for any duplicate `HTTP Listener …` folders/logs you don’t want → **… → Delete** (or **Move** logs into your canonical folder if you prefer).
+* Remove any unintended **Local/File** paths (like `/home/xplg/xplg-single/logs/app/...`) if your plan is “HTTP only” for app logs.
+* If you see a nested `…/10.0.0.85` and you don’t want per-sender nesting, move the logs up and adjust that listener’s **Parent Log Folder** so it points directly to `Zigi-HTTP-App-logs`.
+
+4. **Reset tokens to 1-per-log**
+
+* Open each **kept** HTTP log (`tomcat-catalina`, `tomcat-access`) → generate **Token A/B** (or keep the ones you already assigned), and **revoke** tokens on any deleted logs.
+
+5. **Point Fluent Bit only to the kept tokens**
+
+* In `/etc/fluent-bit/fluent-bit.conf`, ensure exactly these HTTP outputs (and no others):
+
+```ini
+[OUTPUT]
+    Name  http
+    Match xplg.tomcat.catalina
+    Host  10.0.0.85
+    Port  30307
+    URI   /logeye/api/logger.jsp?token=TOKEN_A
+    Format json_lines
+    Json_Date_Key @timestamp
+    Json_Date_Format iso8601
+    Header Content-Type application/json
+    Retry_Limit False
+
+[OUTPUT]
+    Name  http
+    Match xplg.tomcat.access
+    Host  10.0.0.85
+    Port  30307
+    URI   /logeye/api/logger.jsp?token=TOKEN_B
+    Format json_lines
+    Json_Date_Key @timestamp
+    Json_Date_Format iso8601
+    Header Content-Type application/json
+    Retry_Limit False
+```
+
+6. **Keep your working Syslog-TCP output as-is**
+
+```ini
+[OUTPUT]
+    Name                   syslog
+    Match                  host.syslog
+    Host                   10.0.0.85
+    Port                   1468
+    Mode                   tcp
+    syslog_format          rfc5424
+    syslog_facility_preset user
+    syslog_severity_preset info
+    syslog_appname_preset  fluentbit
+    syslog_message_key     log
+```
+
+7. **Restart and verify**
+
+```bash
+sudo systemctl start fluent-bit
+journalctl -u fluent-bit -n 120 --no-pager
+```
+
+* Post one test line to each Tomcat log to confirm routing (optional, if you don’t want to wait for organic traffic):
+
+```bash
+ts="$(date '+%d-%b-%Y %H:%M:%S.%3N')"
+td="/home/xplg/xplg-single/logs/tomcat"
+sudo bash -c "echo '$ts INFO [main] Tomcat hello' >> $td/catalina.$(date +%F).log"
+sudo bash -c "echo '127.0.0.1 - - [$(date +\"%d/%b/%Y:%H:%M:%S %z\")] \"GET /health HTTP/1.1\" 200 2' >> $td/localhost_access_log.$(date +%Y-%m-%d).txt"
+```
+
+* In **Search**, check:
+
+  * `Zigi-Syslog-TCP / syslog-tcp` → syslog entries present.
+  * `Zigi-HTTP-App-logs / tomcat-catalina` → Tomcat lines present.
+  * `Zigi-HTTP-App-logs / tomcat-access` → access lines present.
+
+---
+
+## How to avoid duplicates going forward
+
+* Use **one token per log**, and keep only those two tokens in your FB config.
+* In each **HTTP listener** “Edit Data”, set **Parent Log Folder** to the **one** folder you want (e.g., `Zigi-HTTP-App-logs`). Disable any option that auto-nests by source IP/hostname if you don’t want that structure.
+* Don’t mix **Local/File** sources with **HTTP** for the same files unless you intend duplication.
+
+---
+
+If you’d like, I can walk the UI move/delete steps against your current tree (“which of these three items should remain?”) and produce the exact click path. Once the tree is clean, we’ll finish wiring the two HTTP outputs and validate the Tomcat parsers.
+
+
+
+You’re asking why that access-log test command failed and want a corrected, copy-paste way to append a valid Tomcat access line.
+
+## What went wrong (brief)
+
+Your quoting got tangled. The outer `"..."` for `bash -c` plus the inner `"..."` around the `date` format made the shell pass a broken argument to `date`, so it saw an extra operand near `%z"`. Result: `date: extra operand ‘%z"'`.
+
+## Do this instead (safe, readable)
+
+### Option A — set vars, then append with `sudo tee -a` (my favorite)
+
+```bash
+TD="/home/xplg/xplg-single/logs/tomcat"
+D=$(date '+%d/%b/%Y:%H:%M:%S %z')
+F="$TD/localhost_access_log.$(date +%Y-%m-%d).txt"
+
+printf '127.0.0.1 - - [%s] "GET /health HTTP/1.1" 200 2\n' "$D" \
+| sudo tee -a "$F" >/dev/null
+```
+
+### Option B — one-liner with `sudo bash -c` (properly quoted)
+
+```bash
+sudo bash -c 'D=$(date "+%d/%b/%Y:%H:%M:%S %z"); \
+F="/home/xplg/xplg-single/logs/tomcat/localhost_access_log.$(date +%Y-%m-%d).txt"; \
+printf "127.0.0.1 - - [%s] \"GET /health HTTP/1.1\" 200 2\n" "$D" >> "$F"'
+```
+
+### (Bonus) catalina test line (single line, no multiline)
+
+```bash
+TS="$(date '+%d-%b-%Y %H:%M:%S.%3N')"
+echo "$TS INFO [main] Tomcat hello" | sudo tee -a "/home/xplg/xplg-single/logs/tomcat/catalina.$(date +%F).log" >/dev/null
+```
+
+## Next
+
+* After running the access-log append, check your XPLG **tomcat-access** log (HTTP token target) and confirm fields parse as expected.
+* If you want, I can give you quick `journalctl`/`stdout` mirror outputs so you can see exactly what Fluent Bit sends while you test.
+--
+
+
+You’re asking two things:
+
+1. why the UI shows only **2 of the 3** streams you expect, and
+2. what I mean by “parser” in XPLG (since there’s no “Parser Type” dropdown) + how to set it up correctly before adding more listeners.
+
+Here’s the straight answer and the fixes.
+
+---
+
+## Why you only see 2/3
+
+* In the **Overview → Active log data** table XPLG only lists logs that had **recent events**. From your screenshot I see activity for **Syslog TCP-zigi** and **Access Log**. The **third** (your Tomcat **catalina** log) likely hasn’t received anything yet or Fluent Bit is posting to the wrong token/log.
+* The “Listeners” section shows both HTTP listeners exist (catalina & access), but only one shows a log receiving data. So wiring is almost done—one stream just isn’t landing.
+
+### Quick, deterministic check (no guessing)
+
+1. **Confirm the intended token→log mapping in XPLG**
+
+   * Open **Folders & Logs → Zigi-HTTP-App-logs → tomcat-catalina → Edit**. Copy its **token** (call it `TOKEN_A`).
+   * Open **… → tomcat-access → Edit**. Copy its **token** (call it `TOKEN_B`).
+
+2. **Confirm Fluent Bit is using those tokens and tags**
+
+```bash
+# show the http outputs you actually run with
+grep -nA4 -E '^\[OUTPUT\]|URI|Match|Host|Port' /etc/fluent-bit/fluent-bit.conf
+
+# show the tomcat inputs & tags
+grep -nA4 -E '^\[INPUT\]|Path|Tag' /etc/fluent-bit/fluent-bit.conf
+```
+
+You should see:
+
+* `[INPUT] … la` and `[INPUT] … Tag xplg.tomcat.access`
+* `[OUTPUT] … Match xplg.tomcat.catalina … URI …token=TOKEN_A`
+* `[OUTPUT] … Match xplg.tomcat.access … URI …token=TOKEN_B`
+
+3. **Send one unmistakable line to each stream (optional but instant)**
+
+```bash
+# catalina
+TS="$(date '+%d-%b-%Y %H:%M:%S.%3N')"
+echo "$TS INFO [main] CATALINA_TEST hello" \
+| sudo tee -a "/home/xplg/xplg-single/logs/tomcat/catalina.$(date +%F).log" >/dev/null
+
+# access
+TD="/home/xplg/xplg-single/logs/tomcat"
+D=$(date '+%d/%b/%Y:%H:%M:%S %z')
+F="$TD/localhost_access_log.$(date +%Y-%m-%d).txt"
+printf '127.0.0.1 - - [%s] "GET /CATALINA_ACCESS_TEST HTTP/1.1" 200 2\n' "$D" \
+| sudo tee -a "$F" >/dev/null
+```
+
+Search each target log. If **catalina** still doesn’t show, the token/Match is wrong—fix per step 2.
+
+> Tip: while tuning, add temporary mirrors to see exactly what FB sends:
+>
+> ```ini
+> [OUTPUT] Name stdout  Match xplg.tomcat.catalina
+> [OUTPUT] Name stdout  Match xplg.tomcat.access
+> ```
+>
+> Then `journalctl -u fluent-bit -f` to watch the outgoing records. Remove when done.
+
+---
+
+## “Parser” in XPLG = patterns you add in **Edit Data**
+
+There’s no global “Parser Type” dropdown. In XPLG you keep a **base pattern** (e.g., the Syslog header you already have) and then add **Active Log Pattern** rows (regex-based) to parse the **Message** text into fields.
+
+### Recommended patterns
+
+**A) Tomcat access log (attach to your tomcat-access log)**
+Use a Common/Combined Log Format pattern so you get named fields:
+
+```
+^(?<client_ip>\S+)\s+(?<ident>\S+)\s+(?<user>\S+)\s+\[(?<time>[^\]]+)\]\s+"(?<method>\S+)\s+(?<path>\S+)\s+(?<protocol>[^"]+)"\s+(?<status>\d{3})\s+(?<bytes>\S+)
+```
+
+Fields you’ll see: `client_ip, ident, user, time, method, path, protocol, status, bytes`.
+
+**B) Tomcat catalina (attach to your tomcat-catalina log)**
+Typical catalina line:
+
+```
+DD-Mmm-YYYY HH:MM:SS.mmm LEVEL [thread] logger message...
+```
+
+Pattern:
+
+```
+^(?<ts>\d{2}-[A-Za-z]{3}-\d{4} \d{2}:\d{2}:\d{2}\.\d{3})\s+(?<level>[A-Z]+)\s+\[(?<thread>[^\]]+)\]\s+(?<logger>\S+)\s+(?<message>.*)
+```
+
+Now you’ll have `ts, level, thread, logger, message`.
+
+**C) Syslog TCP-zigi (optional refinements)**
+Keep your base **Syslog RFC5424** pattern. To structure the **Message** further, add (ordered):
+
+1. Fluent Bit module lines:
+
+```
+^(?<Application Name>fluentbit)(?:\[(?<Process Id>\d+)\])?:\s+\[(?<fb_level>[a-z]+)\]\s+\[(?<fb_module>[^\]]+)\]\s+(?<fb_detail>.+)$
+```
+
+2. Generic daemon lines:
+
+```
+^(?<Application Name>[^:\[\]]+)(?:\[(?<Process Id>\d+)\])?:\s+(?<Detail>.+)$
+```
+
+> In **Edit Data → Active Log Pattern List**: click **Add**, set **Apply On: Message**, paste the regex, save. Order: specific (Fluent Bit) first, generic second.
+
+---
+
+## Why two “http\_error” entries showed earlier
+
+That usually appears if an **HTTP listener** had a default error log enabled or a mis-post happened (wrong token/path), creating entries under a default “http\_error” log. Once you keep **exactly one token per log** and only those URIs in Fluent Bit, the “http\_error” lines should stop. You can delete that log if you don’t need it.
+
+---
+
+## Quick checklist to get to “all 3 visible”
+
+* [ ] XPLG has three target logs: **syslog-tcp**, **tomcat-catalina**, **tomcat-access**.
+* [ ] Exactly **one token per HTTP log**; FB uses those URIs and correct `Match` tags.
+* [ ] Generate one line per stream (or wait for real traffic).
+* [ ] In **Overview → Active log data**, you’ll now see all three; in **Search**, scope to each log and verify patterns extract fields.
+
+If you want, tell me the exact names of the two HTTP logs as they appear in your tree; I’ll write the click-by-click to add the patterns and we’ll verify with one test line each.
+
+
+You’re asking me to sanity-check your **host folder structure vs. the container bind-mounts**, confirm what the **correct Fluent Bit input paths** should be, and why you might only see **2/3 streams** in XPLG.
+
+## What I see & the answer you need
+
+* The `ls` you sent shows:
+
+  * **Tomcat** logs on host: `/home/xplg/xplg-single/logs/tomcat/` (e.g., `catalina.2025-09-18.log`, `localhost_access_log.2025-09-18.txt`)
+  * **XPLG app** logs on host: `/home/xplg/xplg-single/logs/app/` (e.g., `XpoLogConsole.log`)
+* That matches the docker bind-mount plan (container writes to its internal paths; those are **mounted** onto these **host** paths).
+* So your **Fluent Bit input paths are correct** when you use:
+
+  * `/home/xplg/xplg-single/logs/tomcat/catalina.*.log`
+  * `/home/xplg/xplg-single/logs/tomcat/localhost_access_log.*.txt`
+  * `/home/xplg/xplg-single/logs/app/*.log`
+
+Nothing to change there.
+
+---
+
+## Why you’re likely seeing only 2 of 3 logs in XPLG
+
+One of these is happening:
+
+1. **No new catalina lines since FB started**
+   You have `Read_From_Head Off`, so only **new** lines are shipped. If catalina was quiet, XPLG won’t show it yet.
+
+2. **Token mismatch** (catalina output using the access token, or vice-versa)
+   FB will happily post—just to the wrong log.
+
+3. **Listener shows “Logs=0”**
+   That HTTP listener exists but has **no log** configured under it (or the token doesn’t belong to the log you expect).
+
+---
+
+## Fast checks (copy/paste)
+
+**Confirm FB tags/URIs/tokens**
+
+```bash
+# Inputs (tags)
+grep -nA4 -E '^\[INPUT\]|Path|Tag' /etc/fluent-bit/fluent-bit.conf
+
+# HTTP outputs (tokens/Match)
+grep -nA4 -E '^\[OUTPUT\]|Match|URI|Host|Port' /etc/fluent-bit/fluent-bit.conf
+```
+
+Expected:
+
+* `Tag xplg.tomcat.catalina` → URI ends with `token=TOKEN_A`
+* `Tag xplg.tomcat.access`   → URI ends with `token=TOKEN_B`
+
+**Force fresh lines so they ship**
+
+```bash
+# catalina
+TS="$(date '+%d-%b-%Y %H:%M:%S.%3N')"
+echo "$TS INFO [main] CATALINA_TEST hello" \
+| sudo tee -a "/home/xplg/xplg-single/logs/tomcat/catalina.$(date +%F).log" >/dev/null
+
+# access
+TD="/home/xplg/xplg-single/logs/tomcat"
+D=$(date '+%d/%b/%Y:%H:%M:%S %z')
+printf '127.0.0.1 - - [%s] "GET /CATALINA_ACCESS_TEST HTTP/1.1" 200 2\n' "$D" \
+| sudo tee -a "$TD/localhost_access_log.$(date +%Y-%m-%d).txt" >/dev/null
+```
+
+**(Optional) Preview exactly what FB is sending**
+
+```ini
+# add TEMP outputs, then restart FB and watch journal
+[OUTPUT] Name stdout Match xplg.tomcat.catalina
+[OUTPUT] Name stdout Match xplg.tomcat.access
+```
+
+```bash
+sudo systemctl restart fluent-bit
+journalctl -u fluent-bit -f --no-pager
+```
+
+Remove the TEMP outputs after you’re satisfied.
+
+---
+
+## Permissions sanity (only if you still see nothing)
+
+Your files are `root:root`. If Fluent Bit runs **as root** (common), that’s fine. If your unit runs as a user (e.g., `fluent-bit`), grant read access:
+
+```bash
+# See which user runs FB
+ps -o user= -p "$(pgrep -x fluent-bit)"
+
+# If not root, allow reads
+sudo setfacl -m u:fluent-bit:r /home/xplg/xplg-single/logs/tomcat/* /home/xplg/xplg-single/logs/app/*
+```
+
+---
+
+## Bottom line
+
+* Your **input paths are correct** for the bind-mounts you showed.
+* If catalina isn’t showing, it’s almost certainly **no new lines** or a **token/Match mix-up**. Run the checks above, append the test lines, and you should see all **three** logs in XPLG within seconds.
+
+
+You’re asking me to clarify the difference between an **XPLG Folder** and a **Log**, whether a **Log = log-type**, and why I keep advising **not** to give a Folder the same name as its child Log. Here’s the clean, no-nonsense breakdown.
+
+---
+
+### What each thing is (and why it matters)
+
+**Folder**
+
+* A container/namespace in XPLG.
+* Used for organization, scoping in Search, inheritance of defaults (collection policy, tags), access control, and dashboards.
+* Can hold many **Logs** (and sub-folders).
+
+**Log**
+
+* The actual **ingestion target** and **parsing/unit of storage**.
+* Where you attach/maintain: listener binding, token (for HTTP listeners), parser rules/patterns, retention/collection policy (inherited or overridden).
+* Each Log produces its own searchable stream and schema (fields).
+
+> Mental model: **Folder = where it lives**. **Log = what gets ingested and how it’s parsed**.
+
+---
+
+### Does a “Log” represent a log-type?
+
+Often yes—that’s a good practice. A Log typically maps to a **type + purpose**, e.g.:
+
+* `syslog-tcp` (RFC5424 via TCP 1468)
+* `tomcat-catalina` (Catalina app log)
+* `tomcat-access` (Access/CLF)
+* `xplg-app` (XPLG app internal log)
+
+But it’s more precise to say: **a Log is a single stream with its own parser and (for HTTP) its own token**. Multiple sources of the *same* type can feed the same Log if you want one combined view; or you can split per env/host if you need isolation.
+
+---
+
+### Why not give a Folder the same name as its Log?
+
+Short answer: it creates confusion and real foot-guns.
+
+* **UI ambiguity:** the tree shows `Folder / Log`. If both are named “tomcat-catalina”, it’s easy to click/edit the wrong node.
+* **Routing clarity:** tokens are bound to **Logs**, not Folders. Same names make it harder to spot when you posted to the wrong place.
+* **Scaling:** if later you add `tomcat-access` alongside `tomcat-catalina`, identical folder/log names become messy (duplicates, accidental nesting by sender IP, etc.).
+* **Automation/search:** breadcrumbs and filters are clearer when names are distinct (`Zigi-HTTP-App-logs / tomcat-catalina` is unambiguous).
+
+Use descriptive, *different* names: a Folder groups a set of related Logs; each Log name states the stream/type.
+
+---
+
+### Suggested structure for your project (fits what we wired)
+
+* **Folder** `Zigi-Syslog-TCP`
+
+  * **Log** `syslog-tcp` (Parser: Syslog RFC5424, Listener: TCP 1468)
+
+* **Folder** `Zigi-HTTP-App-logs`
+
+  * **Log** `tomcat-catalina` (HTTP token A; patterns for Catalina)
+  * **Log** `tomcat-access` (HTTP token B; CLF pattern)
+  * *(optional)* **Log** `xplg-app` (HTTP token C; patterns for XPLG app)
+
+**Naming tip:** `<area>-<ingest>-<type>` or `<app>-<type>-<env>` (e.g., `zigi-http-tomcat-access-prod`).
+
+---
+
+### Quick do’s & don’ts
+
+**Do**
+
+* Keep **one token per Log** (one-to-one).
+* Route each Fluent Bit tag to **exactly one** output (no duplicates).
+* Add parsing **in the Log’s “Edit Data → Active Log Pattern List”** (not at the Folder; not in Fluent Bit).
+
+**Don’t**
+
+* Create a Folder and a Log with the **same exact name**.
+* Reuse the same token in multiple Logs.
+* Mix **Local/File** and **HTTP** inputs for the same files unless you really want duplicates.
+
+---
+
+### If you want to clean up now (safe steps)
+
+1. Stop shipping temporarily: `sudo systemctl stop fluent-bit`.
+2. In **Folders & Logs**:
+
+   * Keep `Zigi-Syslog-TCP / syslog-tcp`.
+   * Keep `Zigi-HTTP-App-logs / tomcat-catalina` and `/ tomcat-access`.
+   * Delete/move any stray **path-looking** items (those were Local/File sources).
+3. Open each kept HTTP Log → confirm/generate **its own token**.
+4. In Fluent Bit, ensure:
+
+   * `Match host.syslog` → **Syslog TCP 1468**.
+   * `Match xplg.tomcat.catalina` → **HTTP token A**.
+   * `Match xplg.tomcat.access` → **HTTP token B**.
+5. Start shipping: `sudo systemctl start fluent-bit`.
+
+This keeps your tree clean and your parsing logic attached to the **Logs** where it belongs.
+
+
+TD="/home/xplg/xplg-single/logs/tomcat"
+D=$(date '+%d/%b/%Y:%H:%M:%S %z')
+printf '127.0.0.1 - - [%s] "GET /ZIGGGIIICATALINA_ACCESS_TEST HTTP/1.1" 200 2\n' "$D" \
+| sudo tee -a "$TD/localhost_access_log.$(date +%Y-%m-%d).txt" >/dev/null
+
+
+-----
+
+
+You’re asking me to: (1) map what’s happening in your UI (why you only see **1** Tomcat log and why an **IP folder** appeared), (2) clean it up so you have **exactly three HTTP logs** (tomcat-access, tomcat-catalina, xplg-app), and (3) give the Fluent Bit + test steps for those three.
+
+Here’s what’s going on and how to fix it—step-by-step.
+
+---
+
+## What’s happening right now (why you see only 1 log + the IP folder)
+
+* You **did land access entries** (your search for `/ZIGGGIIICATALINA_ACCESS_TEST` found them).
+* In **Folders & Logs** you see `Zigi-HTTP-App-logs / Tomcat / 10.0.0.85 / tomcat-access 10.0.0.85`.
+  That structure means your HTTP listener was created with **“nest by source device/IP”** (or a similar option). XPLG auto-created the `10.0.0.85` subfolder and then the log inside it. That’s why you didn’t “create the IP folder”—the listener did.
+* You **don’t** see a separate “tomcat-catalina” log because either:
+
+  1. it wasn’t created/bound yet, or
+  2. Fluent Bit is posting catalina lines to the **same access token** (so everything shows under the one log).
+
+Result: only **one** HTTP log is recognized under that listener.
+
+---
+
+## Clean, unambiguous target structure (one-time)
+
+We’ll keep things flat and obvious (no IP nesting):
+
+```
+Zigi-HTTP-App-logs
+  ├─ tomcat-access      (Token_B)
+  ├─ tomcat-catalina    (Token_A)
+  └─ xplg-app           (Token_C)   # XpoLogConsole.log
+```
+
+> Each **Log** has **its own token**. No per-source/IP subfolders.
+
+---
+
+## UI cleanup & rewire (safe order)
+
+1. **Pause the shipper**
+
+   ```bash
+   sudo systemctl stop fluent-bit
+   ```
+
+2. **Fix the tree in XPLG**
+
+   * In **Folders & Logs**, locate `…/Tomcat/10.0.0.85/tomcat-access 10.0.0.85`.
+
+     * **Move** it up to the folder `Zigi-HTTP-App-logs`.
+     * **Rename** it to `tomcat-access`.
+     * Delete the now-empty `10.0.0.85` and `Tomcat` subfolders.
+   * Create two more logs under `Zigi-HTTP-App-logs`:
+
+     * `tomcat-catalina` → generate **Token\_A**
+     * `xplg-app`        → generate **Token\_C**
+   * Open each of the three logs and make sure they’re **not configured** to auto-nest by source IP. Parent should be exactly `Zigi-HTTP-App-logs`.
+
+3. **(Optional but helpful)** add AppTags:
+
+   * `tomcat-access`: `tomcat`, `access`
+   * `tomcat-catalina`: `tomcat`, `catalina`
+   * `xplg-app`: `xplg`, `app`
+
+---
+
+## Fluent Bit (ship-only) — three inputs → three HTTP outputs
+
+(Keep your syslog-TCP output as is; below is just for the three app streams.)
+
+```ini
+# ---------- INPUTS (already correct paths per your ls) ----------
+[INPUT]
+    Name              tail
+    Path              /home/xplg/xplg-single/logs/tomcat/localhost_access_log.*.txt
+    Tag               xplg.tomcat.access
+    DB                /var/lib/fluent-bit/tomcat-access.pos
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+    Path_Key          file
+
+[INPUT]
+    Name              tail
+    Path              /home/xplg/xplg-single/logs/tomcat/catalina.*.log
+    Tag               xplg.tomcat.catalina
+    DB                /var/lib/fluent-bit/tomcat-catalina.pos
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+    Path_Key          file
+
+[INPUT]
+    Name              tail
+    Path              /home/xplg/xplg-single/logs/app/*.log
+    Tag               xplg.app
+    DB                /var/lib/fluent-bit/xplg-app.pos
+    Read_From_Head    Off
+    Skip_Long_Lines   On
+    Path_Key          file
+
+# ---------- OUTPUTS (one token per log) ----------
+[OUTPUT]
+    Name               http
+    Match              xplg.tomcat.access
+    Host               10.0.0.85
+    Port               30307
+    URI                /logeye/api/logger.jsp?token=TOKEN_B
+    Format             json_lines
+    Json_Date_Key      @timestamp
+    Json_Date_Format   iso8601
+    Header             Content-Type application/json
+    Retry_Limit        False
+
+[OUTPUT]
+    Name               http
+    Match              xplg.tomcat.catalina
+    Host               10.0.0.85
+    Port               30307
+    URI                /logeye/api/logger.jsp?token=TOKEN_A
+    Format             json_lines
+    Json_Date_Key      @timestamp
+    Json_Date_Format   iso8601
+    Header             Content-Type application/json
+    Retry_Limit        False
+
+[OUTPUT]
+    Name               http
+    Match              xplg.app
+    Host               10.0.0.85
+    Port               30307
+    URI                /logeye/api/logger.jsp?token=TOKEN_C
+    Format             json_lines
+    Json_Date_Key      @timestamp
+    Json_Date_Format   iso8601
+    Header             Content-Type application/json
+    Retry_Limit        False
+```
+
+> Notes:
+> • We’re **not** parsing or multiline-stitching in Fluent Bit. XPLG will parse.
+> • `Read_From_Head Off` means **only new lines** will ship—so we’ll append tests.
+
+---
+
+## Bring it up & send one clear test to each
+
+```bash
+sudo systemctl start fluent-bit
+journalctl -u fluent-bit -n 80 --no-pager
+
+# 1) access
+TD="/home/xplg/xplg-single/logs/tomcat"
+D=$(date '+%d/%b/%Y:%H:%M:%S %z')
+printf '127.0.0.1 - - [%s] "GET /ACCESS_TEST HTTP/1.1" 200 2\n' "$D" \
+| sudo tee -a "$TD/localhost_access_log.$(date +%Y-%m-%d).txt" >/dev/null
+
+# 2) catalina
+TS="$(date '+%d-%b-%Y %H:%M:%S.%3N')"
+echo "$TS INFO [main] CATALINA_TEST hello" \
+| sudo tee -a "$TD/catalina.$(date +%F).log" >/dev/null
+
+# 3) xplg-app
+echo "XPLG_APP_TEST $(date -Is)" \
+| sudo tee -a "/home/xplg/xplg-single/logs/app/XpoLogConsole.log" >/dev/null
+```
+
+#### validate fluentbit config file
+
+
+# 2) Validate config (prints the real error)
+sudo /opt/fluent-bit/bin/fluent-bit -c /etc/fluent-bit/fluent-bit.conf -t
+
+sudo /opt/fluent-bit/bin/fluent-bit -c /etc/fluent-bit/fluent-bit.conf -D
+---
+
+
+**Verify in XPLG:**
+
+* `Search → Logs → tomcat-access` → find `/ACCESS_TEST`
+* `Search → Logs → tomcat-catalina` → find `CATALINA_TEST hello`
+* `Search → Logs → xplg-app` → find `XPLG_APP_TEST`
+
+If one doesn’t show, it’s almost always a token/Match mismatch. Use:
+
+```bash
+grep -nA4 -E '^\[OUTPUT\]|Match|URI' /etc/fluent-bit/fluent-bit.conf
+```
+
+to double-check the token each tag uses.
+
+---
+
+## About “Parser” in the UI (clarification)
+
+There isn’t a global “Parser Type” dropdown. In XPLG you keep a base pattern (e.g., Syslog header for syslog logs) and then add **Active Log Pattern** rows (regex-based) **in each Log’s Edit Data** to parse the **Message** field. For these three logs:
+
+* **tomcat-access**: add a CLF pattern to extract `client_ip, time, method, path, status, bytes`:
+
+  ```
+  ^(?<client_ip>\S+)\s+(?<ident>\S+)\s+(?<user>\S+)\s+\[(?<time>[^\]]+)\]\s+"(?<method>\S+)\s+(?<path>\S+)\s+(?<protocol>[^"]+)"\s+(?<status>\d{3})\s+(?<bytes>\S+)
+  ```
+
+* **tomcat-catalina**: add a catalina pattern:
+
+  ```
+  ^(?<ts>\d{2}-[A-Za-z]{3}-\d{4} \d{2}:\d{2}:\d{2}\.\d{3})\s+(?<level>[A-Z]+)\s+\[(?<thread>[^\]]+)\]\s+(?<logger>\S+)\s+(?<message>.*)
+  ```
+
+* **xplg-app**: start simple, pattern on your line shape; we can refine after a sample.
+
+(You can add those by **Edit Data → Active Log Pattern List → Add → Regex**, “Apply On: Message”.)
+
+---
+
+## TL;DR
+
+* The **IP subfolder** appeared because the HTTP listener was configured to **nest by source device**. Move/rename the log, turn nesting off, and keep **one token per log**.
+* Create **three HTTP logs** flat under `Zigi-HTTP-App-logs` and wire FB tags to their tokens.
+* Append a test line to each file (because shipping is “new lines only”).
+* Add per-log parsing patterns **in the Log’s Edit screen** (not at the folder, not in Fluent Bit).
+
+If you want, tell me the **three token strings** you generated (redact all but last 4 if you prefer) and I’ll echo back the exact three `[OUTPUT]` blocks with your tokens slotted in so you can paste without mistakes.
+
+
+
+##### Friday Sep 19 
+
+echo "XPLG_APP_TEST $(date -Is)" \
+| sudo tee -a "/home/xplg/xplg-single/logs/app/XpoLogConsole.log" >/dev/null
+
+
+You’re asking to roll back and use the **one-HTTP-listener** approach: **one token**, Fluent Bit ships all three app streams to that single endpoint, and **XPLG** does the **splitting** into three logs based on parsers/rules (not Fluent Bit). That makes sense. Here’s the clean, step-by-step way to do it.
+
+---
+
+# A) What we’ll end up with
+
+**One HTTP listener/token** (call it `TOKEN_ALL`) → **one account** in XPLG → **three logs under that same account**:
+
+```
+Zigi-HTTP-App-logs/
+  ├─ tomcat-access     (bound to TOKEN_ALL)
+  ├─ tomcat-catalina   (bound to TOKEN_ALL)
+  └─ xplg-app          (bound to TOKEN_ALL)
+```
+
+XPLG will **route** each event to the right log by matching the **source file path** (carried from Fluent Bit via `Path_Key file`) and then parse it there. Syslog-TCP stays as-is (separate listener).
+
+---
+
+# B) Fluent Bit: collapse to **one HTTP output**
+
+Keep the three inputs, keep Syslog-TCP, but send all *app* streams to the **same token**. Make sure each tail input sets `Path_Key file` (so XPLG can split by file).
+
+```ini
+# ---------- INPUTS (unchanged paths, add Path_Key file if missing) ----------
+[INPUT]
+    Name  tail
+    Path  /home/xplg/xplg-single/logs/tomcat/localhost_access_log.*.txt
+    Tag   xplg.tomcat.access
+    DB    /var/lib/fluent-bit/tomcat-access.pos
+    Read_From_Head  Off
+    Skip_Long_Lines On
+    Path_Key        file
+
+[INPUT]
+    Name  tail
+    Path  /home/xplg/xplg-single/logs/tomcat/catalina.*.log
+    Tag   xplg.tomcat.catalina
+    DB    /var/lib/fluent-bit/tomcat-catalina.pos
+    Read_From_Head  Off
+    Skip_Long_Lines On
+    Path_Key        file
+
+[INPUT]
+    Name  tail
+    Path  /home/xplg/xplg-single/logs/app/*.log
+    Tag   xplg.app
+    DB    /var/lib/fluent-bit/xplg-app.pos
+    Read_From_Head  Off
+    Skip_Long_Lines On
+    Path_Key        file
+
+# ---------- ONE HTTP OUTPUT (same token for all) ----------
+[OUTPUT]
+    Name             http
+    Match_Regex      ^xplg\.(tomcat\.(access|catalina)|app)$
+    Host             10.0.0.85
+    Port             30307
+    URI              /logeye/api/logger.jsp?token=TOKEN_ALL
+    Format           json_lines
+    Json_Date_Key    @timestamp
+    Json_Date_Format iso8601
+    Header           Content-Type application/json
+    Retry_Limit      False
+```
+
+> If your FB build doesn’t support `Match_Regex`, use **two** identical `http` outputs (both with the same `URI` / token): one with `Match xplg.tomcat.*` and one with `Match xplg.app`.
+
+Restart + tail logs:
+
+```bash
+sudo systemctl restart fluent-bit
+journalctl -u fluent-bit -n 100 --no-pager
+```
+
+---
+
+# C) XPLG: one HTTP **account** with 3 **logs** (split by `file`)
+
+1. **Listeners → HTTP**
+
+   * Pick a single account (keep the token you want as `TOKEN_ALL`).
+   * Make sure **“group by source device/IP” is OFF** for this account (so no auto IP folders).
+
+2. **Under that account, create 3 logs** (all bound to the *same* token/account):
+   Parent folder: `Zigi-HTTP-App-logs`
+
+   * Log `tomcat-access`
+   * Log `tomcat-catalina`
+   * Log `xplg-app`
+
+3. **In each log → Edit Data → Active Log Pattern List**
+   Add a **top “gate” rule** that **keeps only its own files** (Apply On: `file`, put this first).
+
+   * **tomcat-access** gate:
+
+     ```
+     .*/tomcat/localhost_access_log\.\d{4}-\d{2}-\d{2}\.txt$
+     ```
+   * **tomcat-catalina** gate:
+
+     ```
+     .*/tomcat/catalina\.\d{4}-\d{2}-\d{2}\.log$
+     ```
+   * **xplg-app** gate:
+
+     ```
+     .*/logs/app/XpoLogConsole\.log$
+     ```
+
+   In the pattern row, set it as a **Filter / Keep on match** (so this log ignores non-matching events).
+   Result: with the same token, each log will only accept its own events based on the `file` value shipped by Fluent Bit.
+
+4. **Parsing rules in the same logs (still in XPLG)**
+
+   * **tomcat-access** (Apply On: `Message`):
+
+     ```
+     ^(?<client_ip>\S+)\s+(?<ident>\S+)\s+(?<user>\S+)\s+\[(?<time>[^\]]+)\]\s+"(?<method>\S+)\s+(?<path>\S+)\s+(?<protocol>[^"]+)"\s+(?<status>\d{3})\s+(?<bytes>\S+)
+     ```
+   * **tomcat-catalina** (Apply On: `Message`):
+
+     ```
+     ^(?<ts>\d{2}-[A-Za-z]{3}-\d{4} \d{2}:\d{2}:\d{2}\.\d{3})\s+(?<level>[A-Z]+)\s+\[(?<thread>[^\]]+)\]\s+(?<logger>\S+)\s+(?<message>.*)
+     ```
+   * **xplg-app**: start simple, refine after a sample:
+
+     ```
+     ^(?<ts>\S+)\s+(?<message>.*)$
+     ```
+
+> Order matters: the **gate** (Apply On: `file`) must be the **first** rule in each log, so routing happens before parsing.
+
+---
+
+# D) Quick tests (force a fresh line to each file)
+
+```bash
+# access
+TD="/home/xplg/xplg-single/logs/tomcat"
+D=$(date '+%d/%b/%Y:%H:%M:%S %z')
+printf '127.0.0.1 - - [%s] "GET /ONE_TOKEN_ACCESS_TEST HTTP/1.1" 200 2\n' "$D" \
+| sudo tee -a "$TD/localhost_access_log.$(date +%Y-%m-%d).txt" >/dev/null
+
+# catalina
+TS="$(date '+%d-%b-%Y %H:%M:%S.%3N')"
+echo "$TS INFO [main] ONE_TOKEN_CATALINA_TEST hello" \
+| sudo tee -a "$TD/catalina.$(date +%F).log" >/dev/null
+
+# xplg-app
+echo "ONE_TOKEN_XPLG_APP_TEST $(date -Is)" \
+| sudo tee -a "/home/xplg/xplg-single/logs/app/XpoLogConsole.log" >/dev/null
+```
+
+**Verify in XPLG**
+
+* Search **log: tomcat-access** → find `/ONE_TOKEN_ACCESS_TEST` with access fields.
+* Search **log: tomcat-catalina** → find `ONE_TOKEN_CATALINA_TEST hello` with catalina fields.
+* Search **log: xplg-app** → find `ONE_TOKEN_XPLG_APP_TEST`.
+
+Listeners → HTTP → your **one account** should show **Logs = 3**.
+
+---
+
+# E) If something doesn’t split correctly
+
+* In each log’s **Edit Data**, confirm the **gate rule**:
+
+  * **Apply On** = `file`
+  * Regex matches the exact path pattern
+  * Mode = **Keep on match** (so non-matching events are ignored by this log)
+* Confirm Fluent Bit is sending the `file` field (we set `Path_Key file` on every `tail` input).
+* Use a temporary mirror to preview outgoing records:
+
+  ```ini
+  [OUTPUT] Name stdout Match xplg.tomcat.* 
+  [OUTPUT] Name stdout Match xplg.app
+  ```
+
+  Then `journalctl -u fluent-bit -f` to see each record’s `file` and `log`. Remove when done.
+
+---
+
+If you want, tell me which existing token you want to reuse as `TOKEN_ALL` (e.g., last 6–8 chars), and I’ll hand you the exact `[OUTPUT]` block with it embedded so you can paste it verbatim.
+
+
+--You’re asking: **“Can I take one incoming HTTP stream and have XPLG split/parse it into three different folders/logs (and views)?”**
+
+**Yes.** There are two ways—pick the one you want:
+
+## 1) Split (no duplicates) — recommended
+
+One HTTP **token** feeds **three Logs**; each Log keeps only “its” records using a **gate** on the `file` field (sent by Fluent Bit via `Path_Key file`). Each event ends up in **exactly one** Log. You can place those logs under **different folders** if you want.
+
+**How to set it up**
+
+1. Fluent Bit: keep your three `[INPUT] tail` stanzas and ensure each has `Path_Key file`. Use **one** HTTP `[OUTPUT]` (one token).
+2. XPLG → **Listeners → HTTP**: use that single account/token.
+3. Create three Logs (any folders you like), all **bound to the same token**:
+
+   * `tomcat-access`
+   * `tomcat-catalina`
+   * `xplg-app`
+4. In each Log → **Edit Data → Active Log Pattern List**:
+
+   * Add a **top rule** (Apply On: `file`, Action: **Keep on match**) to **gate** by path:
+
+     * access: `.*/tomcat/localhost_access_log\.\d{4}-\d{2}-\d{2}\.txt$`
+     * catalina: `.*/tomcat/catalina\.\d{4}-\d{2}-\d{2}\.log$`
+     * xplg-app: `.*/logs/app/XpoLogConsole\.log$`
+   * Below the gate, add the parser for that log’s message (e.g., CLF for access; Catalina regex for catalina).
+5. Verify: append one line to each file → each appears **only** in its log.
+
+**Pros:** clean separation, independent parsers/retention/ACLs, no data duplication.
+**Cons:** you must maintain the three logs.
+
+## 2) Fan-out (duplicates on purpose)
+
+Bind the **same token** to multiple logs **without** restrictive gates (or with overlapping gates). The **same event** can appear in **multiple** logs/folders (i.e., “copy” to several views).
+
+**Pros:** different teams/views can each get a copy.
+**Cons:** doubles/triples indexed volume and can confuse totals. Use sparingly.
+
+## Alternative: one Log + three saved views
+
+Keep a single log and create **Saved Searches/Dashboards** filtering by `file` (or fields).
+**Pros:** simplest, no duplication. **Cons:** one parser/policy for all, not separate logs.
+
+---
+
+### What I suggest for you right now
+
+Use **Option 1 (Split)** with one token + three logs + `file`-based gates, then attach per-type parsers inside each log. You can place the three logs under **different folders** to match how you want to browse them, and you’ll still be using a **single HTTP listener** and keeping **all parsing in XPLG**.
